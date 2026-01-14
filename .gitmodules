@@ -1,0 +1,3 @@
+[submodule "dep/openlibm"]
+	path = dep/openlibm
+	url = https://github.com/JuliaMath/openlibm.git
