@@ -6,7 +6,58 @@
 
 #include <tee_internal_api.h>
 #include <tee_internal_api_extensions.h>
+#include <pta_system.h>
 #include <llama_ta.h>
+
+// ----------------------------------------------------------------------------
+// pta helper functions
+
+static TEE_Result invoke_system_pta(uint32_t cmd_id, uint32_t param_types, TEE_Param params[TEE_NUM_PARAMS]) {
+	static TEE_TASessionHandle sess = TEE_HANDLE_NULL;
+	static const TEE_UUID uuid = PTA_SYSTEM_UUID;
+
+	if (sess == TEE_HANDLE_NULL) {
+		TEE_Result res = TEE_OpenTASession(&uuid, TEE_TIMEOUT_INFINITE,
+						   0, NULL, &sess, NULL);
+
+		if (res)
+			return res;
+	}
+
+	return TEE_InvokeTACommand(sess, TEE_TIMEOUT_INFINITE, cmd_id,
+				   param_types, params, NULL);
+}
+
+static void* system_alloc(size_t nbytes) {
+    assert(nbytes % PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT == 0);
+    TEE_Param params[TEE_NUM_PARAMS];
+	params[0].value.a = nbytes;
+	params[0].value.b = 0;
+	uint32_t param_types = TEE_PARAM_TYPES(
+        TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_VALUE_OUTPUT,
+        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+	TEE_Result res = invoke_system_pta(PTA_SYSTEM_PROTMEM_ALLOC, param_types, params);
+	if (res != TEE_SUCCESS) {
+		EMSG("Failed to allocate protmem: 0x%x", res);
+		return NULL;
+	}
+    return (void*)reg_pair_to_64(params[1].value.a, params[1].value.b);
+}
+
+static void system_free(void *va, size_t nbytes) {
+    // scrub the memory before freeing
+    memset(va, 0, nbytes);
+
+    TEE_Param params[TEE_NUM_PARAMS];
+    reg_pair_from_64((uint64_t)va, &params[0].value.a, &params[0].value.b);
+    uint32_t param_types = TEE_PARAM_TYPES(
+        TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_NONE,
+        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+	TEE_Result res = invoke_system_pta(PTA_SYSTEM_PROTMEM_FREE, param_types, params);
+	if (res != TEE_SUCCESS) {
+		EMSG("Failed to free protmem: 0x%x", res);
+	}
+}
 
 // ----------------------------------------------------------------------------
 // Transformer model
@@ -57,6 +108,9 @@ typedef struct {
     // kv cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
+    // some more state needed to properly clean up the ephemeral memory
+    void*  va;
+    size_t nbytes;
 } RunState;
 
 typedef struct {
@@ -81,7 +135,15 @@ static size_t get_run_state_nbytes(Config* p) {
     return ret;
 }
 
-static void malloc_run_state(RunState* s, Config* p, float *flat_buf) {
+static void malloc_run_state(RunState* s, Config* p) {
+    size_t nbytes = get_run_state_nbytes(p);
+    nbytes = ROUNDUP(nbytes, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
+    void* va = system_alloc(nbytes);
+    s->va = va;
+    s->nbytes = nbytes;
+    memset(va, 0, nbytes);
+
+    float *flat_buf = va;
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     s->x = flat_buf; flat_buf += p->dim;
     s->xb = flat_buf; flat_buf += p->dim;
@@ -96,6 +158,7 @@ static void malloc_run_state(RunState* s, Config* p, float *flat_buf) {
 }
 
 static void free_run_state(RunState* s) {
+    system_free(s->va, s->nbytes);
 }
 
 static void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
@@ -146,9 +209,13 @@ static void read_config(float *model_bin, Config* config) {
 static void build_transformer(Transformer *t, float* model_bin) {
     // read in the Config from the checkpoint
     read_config(model_bin, &t->config);
+    // allocate the RunState buffers
+    malloc_run_state(&t->state, &t->config);
 }
 
 static void free_transformer(Transformer* t) {
+    // free the RunState buffers
+    free_run_state(&t->state);
 }
 
 // ----------------------------------------------------------------------------
@@ -484,9 +551,8 @@ static TEE_Result generate(Transformer *transformer, Sampler *sampler,
                            uint32_t param_types, TEE_Param params[4]) {
     const uint32_t expected_pt = TEE_PARAM_TYPES(
         TEE_PARAM_TYPE_MEMREF_OUTPUT, TEE_PARAM_TYPE_MEMREF_INPUT,
-        TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_MEMREF_INPUT);
+        TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_NONE);
     if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
-    if (params[3].memref.size < get_run_state_nbytes(&transformer->config)) { return TEE_ERROR_BAD_PARAMETERS; }
     
     // unpack params
     int* generated_tokens = (int*)params[0].memref.buffer;
@@ -495,8 +561,6 @@ static TEE_Result generate(Transformer *transformer, Sampler *sampler,
     int* prompt_tokens = (int*)params[1].memref.buffer;
     int num_prompt_tokens = params[1].memref.size / sizeof(int);
     read_weight(params[2].memref.buffer, &transformer->config, &transformer->weights);
-    memset(params[3].memref.buffer, 0, params[3].memref.size);
-    malloc_run_state(&transformer->state, &transformer->config, params[3].memref.buffer);
 
     // start the main loop
     int token = prompt_tokens[0]; // kick off with the first token in the prompt
@@ -522,7 +586,6 @@ static TEE_Result generate(Transformer *transformer, Sampler *sampler,
     }
     params[0].memref.size = pos * sizeof(int);
 
-    free_run_state(&transformer->state);
     return TEE_SUCCESS;
 }
 

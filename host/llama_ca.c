@@ -293,15 +293,6 @@ void generate(TEEC_Context *ctx, TEEC_Session *sess, Promise *model_bin, Tokeniz
     }
 
     int* generated_tokens = (int*)malloc(steps * sizeof(int));
-    TEEC_SharedMemory flat_buf = {
-        .size = 686192,
-        .flags = TEEC_MEM_INPUT,
-    };
-    TEEC_Result res = TEEC_AllocateSharedMemory(ctx, &flat_buf);
-	if (res != TEEC_SUCCESS) {
-		fprintf(stderr, "TEEC_AllocateSharedMemory failed with code 0x%x\n", res);
-        exit(EXIT_FAILURE);
-    }
     TEEC_Operation op = {
         .params[0].tmpref.buffer = generated_tokens,
         .params[0].tmpref.size = steps * sizeof(int),
@@ -310,14 +301,11 @@ void generate(TEEC_Context *ctx, TEEC_Session *sess, Promise *model_bin, Tokeniz
         .params[2].memref.parent = model_bin,
         .params[2].memref.offset = 0,
         .params[2].memref.size = model_bin->size,
-        .params[3].memref.parent = &flat_buf,
-        .params[3].memref.offset = 0,
-        .params[3].memref.size = flat_buf.size,
         .paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_OUTPUT, TEEC_MEMREF_TEMP_INPUT,
-                                       TEEC_MEMREF_WHOLE, TEEC_MEMREF_WHOLE)
+                                       TEEC_MEMREF_WHOLE, TEEC_NONE)
     };
     uint32_t err_origin;
-	res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_GENERATE, &op, &err_origin);
+	TEEC_Result res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_GENERATE, &op, &err_origin);
 	if (res != TEEC_SUCCESS) {
 		fprintf(stderr, "TEEC_InvokeCommand failed with code 0x%x origin 0x%x\n", res, err_origin);
         exit(EXIT_FAILURE);
@@ -338,7 +326,6 @@ void generate(TEEC_Context *ctx, TEEC_Session *sess, Promise *model_bin, Tokeniz
     }
     printf("\n");
 
-    TEEC_ReleaseSharedMemory(&flat_buf);
     free(generated_tokens);
     free(prompt_tokens);
 }

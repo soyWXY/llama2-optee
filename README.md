@@ -8,6 +8,17 @@ This project is a port of [llama2.c](https://github.com/karpathy/llama2.c) to OP
 
 * **OP-TEE Build Environment**: A working QEMUv8 build of OP-TEE.
     * Reference: [OP-TEE QEMUv8 Documentation](https://optee.readthedocs.io/en/latest/building/devices/qemu.html#qemu-v8)
+    * Custom OP-TEE build instructions
+
+    ```bash
+    mkdir optee
+    cd optee
+    repo init -u https://github.com/soyWXY/manifest -b llama2 -m qemu_v8.xml
+    repo sync -j$(nproc)
+    cd build
+    make toolchains -j$(nproc)
+    make run -j$(nproc)
+    ```
 
 ## Build Instructions
 

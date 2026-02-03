@@ -30,6 +30,6 @@ static void __attribute__((unused)) build_sampler_config(SamplerConfig* config, 
  * param[0] (memref) out: generated tokens
  * param[1] (memref) in: prompt tokens
  * param[2] (memref) in: model binary
- * param[3] (memref) in: buffer for llama inference state
+ * param[3] unused
  */
 #define TA_LLAMA_CMD_GENERATE 0
