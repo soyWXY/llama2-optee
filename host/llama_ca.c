@@ -15,11 +15,9 @@
 #include <tee_client_api.h>
 #include <llama_ta.h>
 // ----------------------------------------------------------------------------
-// single-way and one-shot communication from REE to TEE
+// TEEC_SharedMemory acquire/release helper
 
-typedef TEEC_SharedMemory Promise;
-
-Promise build_promise(TEEC_Context *ctx, char *path) {
+TEEC_SharedMemory *build_promise(TEEC_Context *ctx, char *path) {
     // figure out the file size
     FILE *file = fopen(path, "rb");
     if (!file) { fprintf(stderr, "Couldn't open file %s\n", path); exit(EXIT_FAILURE); }
@@ -33,23 +31,23 @@ Promise build_promise(TEEC_Context *ctx, char *path) {
     void *data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
 
-    Promise promise = {
-        .size = file_size,
-        .flags = TEEC_MEM_INPUT
-    };
-    TEEC_Result res = TEEC_AllocateSharedMemory(ctx, &promise);
+    TEEC_SharedMemory *promise = malloc(sizeof(*promise));
+    promise->size = file_size;
+    promise->flags = TEEC_MEM_INPUT;
+    TEEC_Result res = TEEC_AllocateSharedMemory(ctx, promise);
 	if (res != TEEC_SUCCESS) {
 		fprintf(stderr, "TEEC_AllocateSharedMemory failed with code 0x%x\n", res);
         exit(EXIT_FAILURE);
     }
-    memcpy(promise.buffer, data, promise.size);
+    memcpy(promise->buffer, data, promise->size);
     munmap(data, file_size);
     close(fd);
     return promise;
 }
 
-void free_promise(Promise promise) {
-    TEEC_ReleaseSharedMemory(&promise);
+void free_promise(TEEC_SharedMemory *promise) {
+    TEEC_ReleaseSharedMemory(promise);
+    free(promise);
 }
 
 // ----------------------------------------------------------------------------
@@ -274,7 +272,7 @@ long time_in_ms() {
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate(TEEC_Context *ctx, TEEC_Session *sess, Promise *model_bin, Tokenizer *tokenizer, char *prompt, int steps) {
+void generate(TEEC_Context *ctx, TEEC_Session *sess, Tokenizer *tokenizer, char *prompt, int steps) {
     char *empty_prompt = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
@@ -298,11 +296,8 @@ void generate(TEEC_Context *ctx, TEEC_Session *sess, Promise *model_bin, Tokeniz
         .params[0].tmpref.size = steps * sizeof(int),
         .params[1].tmpref.buffer = prompt_tokens,
         .params[1].tmpref.size = num_prompt_tokens * sizeof(int),
-        .params[2].memref.parent = model_bin,
-        .params[2].memref.offset = 0,
-        .params[2].memref.size = model_bin->size,
         .paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_OUTPUT, TEEC_MEMREF_TEMP_INPUT,
-                                       TEEC_MEMREF_WHOLE, TEEC_NONE)
+                                       TEEC_NONE, TEEC_NONE)
     };
     uint32_t err_origin;
 	TEEC_Result res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_GENERATE, &op, &err_origin);
@@ -334,17 +329,31 @@ void generate(TEEC_Context *ctx, TEEC_Session *sess, Promise *model_bin, Tokeniz
 // CLI, include only if not testing
 #ifndef TESTING
 
-int open_ca_session(TEEC_Session *sess, TEEC_Context *ctx, Promise *model_bin, SamplerConfig *config) {
+void build_operation(TEEC_SharedMemory *model_bin, SamplerConfig *config,
+                     char *model_id, TEEC_Operation *op) {
+    op->params[1].tmpref.buffer = config;
+    op->params[1].tmpref.size = sizeof(*config);
+    op->params[3].tmpref.buffer = model_id;
+    op->params[3].tmpref.size = strlen(model_id);
+    if (model_bin) {
+        op->params[0].memref.parent = model_bin;
+        op->params[0].memref.offset = 0;
+        op->params[0].memref.size = model_bin->size;
+        op->paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_WHOLE, TEEC_MEMREF_TEMP_INPUT,
+                                            TEEC_VALUE_OUTPUT, TEEC_MEMREF_TEMP_INPUT);
+    } else {
+        op->params[0].tmpref.buffer = NULL;
+        op->params[0].tmpref.size = 0;
+        op->paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT, TEEC_MEMREF_TEMP_INPUT,
+                                            TEEC_VALUE_OUTPUT, TEEC_MEMREF_TEMP_INPUT);
+    }
+}
+
+int open_ca_session(TEEC_Session *sess, TEEC_Context *ctx, TEEC_SharedMemory *model_bin,
+                    SamplerConfig *config, char *model_id) {
     TEEC_UUID uuid = TA_LLAMA_UUID;
-    TEEC_Operation op = {
-        .params[0].memref.parent = model_bin,
-        .params[0].memref.offset = 0,
-        .params[0].memref.size = model_bin->size,
-        .params[1].tmpref.buffer = config,
-        .params[1].tmpref.size = sizeof(*config),
-        .paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_WHOLE, TEEC_MEMREF_TEMP_INPUT,
-                                       TEEC_VALUE_OUTPUT, TEEC_NONE)
-    };
+    TEEC_Operation op;
+    build_operation(model_bin, config, model_id, &op);
     uint32_t err_origin;
     TEEC_Result res = TEEC_OpenSession(ctx, sess, &uuid, TEEC_LOGIN_PUBLIC, NULL, &op, &err_origin);
 	if (res != TEEC_SUCCESS) {
@@ -355,22 +364,23 @@ int open_ca_session(TEEC_Session *sess, TEEC_Context *ctx, Promise *model_bin, S
 }
 
 void error_usage() {
-    fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
+    fprintf(stderr, "Usage:   run <model id> [options]\n");
     fprintf(stderr, "Example: run model.bin -n 256 -i \"Once upon a time\"\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
     fprintf(stderr, "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
+    fprintf(stderr, "  -m <string> checkpoint path\n");
     fprintf(stderr, "  -i <string> input prompt\n");
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
-    fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
     exit(EXIT_FAILURE);
 }
 
 int main(int argc, char *argv[]) {
 
     // default parameters
+    char *model_id = NULL;
     char *checkpoint_path = NULL;  // e.g. out/model.bin
     char *tokenizer_path = "tokenizer.bin";
     float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
@@ -380,7 +390,7 @@ int main(int argc, char *argv[]) {
     unsigned long long rng_seed = 0; // seed rng with time by default
 
     // poor man's C argparse so we can override the defaults above from the command line
-    if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
+    if (argc >= 2) { model_id = argv[1]; } else { error_usage(); }
     for (int i = 2; i < argc; i+=2) {
         // do some basic validation
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
@@ -391,6 +401,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'p') { topp = atof(argv[i + 1]); }
         else if (argv[i][1] == 's') { rng_seed = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'n') { steps = atoi(argv[i + 1]); }
+        else if (argv[i][1] == 'm') { checkpoint_path = argv[i + 1]; }
         else if (argv[i][1] == 'i') { prompt = argv[i + 1]; }
         else if (argv[i][1] == 'z') { tokenizer_path = argv[i + 1]; }
         else { error_usage(); }
@@ -414,18 +425,21 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // create promise to send model .bin file to TEE
-    Promise model_bin = build_promise(&ctx, checkpoint_path);
+    // send model .bin file to TEE via TEEC_SharedMemory
+    TEEC_SharedMemory *model_bin = NULL;
+    if (checkpoint_path) {
+        model_bin = build_promise(&ctx, checkpoint_path);
+    }
 
 	TEEC_Session sess;
-    int vocab_size = open_ca_session(&sess, &ctx, &model_bin, &sampler_config);
+    int vocab_size = open_ca_session(&sess, &ctx, model_bin, &sampler_config, model_id);
 
     // build the Tokenizer via the tokenizer .bin file
     Tokenizer tokenizer;
     build_tokenizer(&tokenizer, tokenizer_path, vocab_size);
 
     // run!
-    generate(&ctx, &sess, &model_bin, &tokenizer, prompt, steps);
+    generate(&ctx, &sess, &tokenizer, prompt, steps);
 
     // clean up handles
     free_tokenizer(&tokenizer);

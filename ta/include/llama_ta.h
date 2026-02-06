@@ -6,10 +6,10 @@
 
 /*
  * TA_OpenSessionEntryPoint - Initialize Transformer and Sampler
- * param[0] (memref) in: model binary
+ * param[0] (memref) in: optional, model binary
  * param[1] (memref) in: SamplerConfig
  * param[2] (value.a) out: return transformer.config.vocab_size
- * param[3] unused
+ * param[3] (memref) in: model secure storage id
  */
 
 typedef struct {
@@ -29,7 +29,7 @@ static void __attribute__((unused)) build_sampler_config(SamplerConfig* config, 
  * TA_LLAMA_CMD_GENERATE - Generate tokens
  * param[0] (memref) out: generated tokens
  * param[1] (memref) in: prompt tokens
- * param[2] (memref) in: model binary
+ * param[2] unused
  * param[3] unused
  */
 #define TA_LLAMA_CMD_GENERATE 0

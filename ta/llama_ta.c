@@ -117,6 +117,9 @@ typedef struct {
     Config config; // the hyperparameters of the architecture (the blueprint)
     TransformerWeights weights; // the weights of the model
     RunState state; // buffers for the "wave" of activations in the forward pass
+    // some more state needed to properly clean up the ephemeral memory
+    void*  data;
+    size_t nbytes;
 } Transformer;
 
 static size_t get_run_state_nbytes(Config* p) {
@@ -192,28 +195,29 @@ static void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int
     w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
 
-static void read_weight(float *model_bin, Config* config, TransformerWeights* weights) {
-    // negative vocab size is hacky way of signaling unshared weights. bit yikes.
-    int shared_weights = ((Config*)model_bin)->vocab_size > 0 ? 1 : 0;
-    float* weights_ptr = model_bin + sizeof(Config)/sizeof(float);
-    memory_map_weights(weights, config, weights_ptr, shared_weights);
-}
-
-static void read_config(float *model_bin, Config* config) {
+static void read_checkpoint(Transformer *t, float* data, size_t data_sz) {
+    Config* config = &t->config;
+    t->data = data;
+    t->nbytes = data_sz;
     // read in the config header
-    memcpy(config, model_bin, sizeof(Config));
+    memcpy(config, data, sizeof(Config));
     // negative vocab size is hacky way of signaling unshared weights. bit yikes.
+    int shared_weights = config->vocab_size > 0 ? 1 : 0;
     config->vocab_size = abs(config->vocab_size);
+    float* weights_ptr = data + sizeof(Config)/sizeof(float);
+    memory_map_weights(&t->weights, config, weights_ptr, shared_weights);
 }
 
-static void build_transformer(Transformer *t, float* model_bin) {
-    // read in the Config from the checkpoint
-    read_config(model_bin, &t->config);
+static void build_transformer(Transformer *t, void* data, size_t data_sz) {
+    // read in the Config and the Weights from the checkpoint
+    read_checkpoint(t, data, data_sz);
     // allocate the RunState buffers
     malloc_run_state(&t->state, &t->config);
 }
 
 static void free_transformer(Transformer* t) {
+    // free the TransformerWeights buffers
+    system_free(t->data, t->nbytes);
     // free the RunState buffers
     free_run_state(&t->state);
 }
@@ -551,7 +555,7 @@ static TEE_Result generate(Transformer *transformer, Sampler *sampler,
                            uint32_t param_types, TEE_Param params[4]) {
     const uint32_t expected_pt = TEE_PARAM_TYPES(
         TEE_PARAM_TYPE_MEMREF_OUTPUT, TEE_PARAM_TYPE_MEMREF_INPUT,
-        TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_NONE);
+        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
     if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
     
     // unpack params
@@ -560,7 +564,6 @@ static TEE_Result generate(Transformer *transformer, Sampler *sampler,
     if (steps > transformer->config.seq_len) steps = transformer->config.seq_len; // override to ~max length
     int* prompt_tokens = (int*)params[1].memref.buffer;
     int num_prompt_tokens = params[1].memref.size / sizeof(int);
-    read_weight(params[2].memref.buffer, &transformer->config, &transformer->weights);
 
     // start the main loop
     int token = prompt_tokens[0]; // kick off with the first token in the prompt
@@ -597,6 +600,102 @@ typedef struct {
     Sampler sampler;
 } LlamaData;
 
+// use @id and @bin to save model to secure storage, and return ephemeral buffer with @data_p and @data_sz_p
+static TEE_Result create_secure_storage(TEE_Param id, TEE_Param bin, void **data_p, size_t *data_sz_p) {
+    size_t obj_id_sz = id.memref.size;
+    char *obj_id = malloc(obj_id_sz);
+    if (!obj_id) return TEE_ERROR_OUT_OF_MEMORY;
+    memcpy(obj_id, id.memref.buffer, obj_id_sz);
+
+    size_t data_sz = ROUNDUP(bin.memref.size, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
+    void *data = system_alloc(data_sz);
+    TEE_Result res;
+    if (!data) {
+        res = TEE_ERROR_OUT_OF_MEMORY;
+        goto free_obj;
+    }
+    memcpy(data, bin.memref.buffer, bin.memref.size);
+
+	uint32_t obj_data_flag = TEE_DATA_FLAG_ACCESS_READ |	// we can later read the oject
+			TEE_DATA_FLAG_ACCESS_WRITE |		// we can later write into the object
+			TEE_DATA_FLAG_ACCESS_WRITE_META |	// we can later destroy or rename the object
+			TEE_DATA_FLAG_OVERWRITE;		// destroy existing object of same ID
+	TEE_ObjectHandle object = TEE_HANDLE_NULL;
+	res = TEE_CreatePersistentObject(TEE_STORAGE_PRIVATE,
+					obj_id, obj_id_sz,
+					obj_data_flag,
+					TEE_HANDLE_NULL,
+					data, data_sz,
+					&object);
+	if (res != TEE_SUCCESS) {
+		EMSG("TEE_CreatePersistentObject failed 0x%08x", res);
+		goto free_data;
+	}
+
+    *data_p = data;
+    *data_sz_p = data_sz;
+    TEE_CloseObject(object);
+    free(obj_id);
+    return TEE_SUCCESS;
+free_data:
+    system_free(data, data_sz);
+free_obj:
+    free(obj_id);
+    return res;
+}
+
+// use @id to read model from secure storage, and return ephemeral buffer with @data_p and @data_sz_p
+static TEE_Result read_secure_storage(TEE_Param id, void **data_p, size_t *data_sz_p) {
+	size_t obj_id_sz = id.memref.size;
+    char *obj_id = malloc(obj_id_sz);
+    if (!obj_id) return TEE_ERROR_OUT_OF_MEMORY;
+
+    memcpy(obj_id, id.memref.buffer, obj_id_sz);
+
+	// Check the object exist and can be dumped into output buffer
+	// then dump it.
+	TEE_ObjectHandle object = TEE_HANDLE_NULL;
+	TEE_Result res = TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
+					obj_id, obj_id_sz,
+					TEE_DATA_FLAG_ACCESS_READ |
+					TEE_DATA_FLAG_SHARE_READ,
+					&object);
+	if (res != TEE_SUCCESS) {
+		EMSG("Failed to open persistent object, res=0x%08x", res);
+		goto free_id;
+	}
+
+	TEE_ObjectInfo object_info = { };
+	res = TEE_GetObjectInfo1(object, &object_info);
+	if (res != TEE_SUCCESS) {
+		EMSG("Failed to get object info, res=0x%08x", res);
+		goto close_obj;
+	}
+
+    size_t data_sz = ROUNDUP(object_info.dataSize, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
+    char *data = system_alloc(data_sz);
+    if (!data) {
+        res = TEE_ERROR_OUT_OF_MEMORY;
+        goto close_obj;
+    }
+
+	uint32_t read_bytes = 0;
+	res = TEE_ReadObjectData(object, data, object_info.dataSize, &read_bytes);
+	if (res != TEE_SUCCESS || read_bytes != object_info.dataSize) {
+		EMSG("TEE_ReadObjectData failed 0x%08x, read %" PRIu32 " over %u",
+				res, read_bytes, object_info.dataSize);
+        system_free(data, data_sz);
+		goto close_obj;
+	}
+    *data_p = data;
+    *data_sz_p = data_sz;
+close_obj:
+	TEE_CloseObject(object);
+free_id:    
+    free(obj_id);
+    return res;
+}
+
 TEE_Result TA_InvokeCommandEntryPoint(void *session, uint32_t cmd, uint32_t param_types, TEE_Param params[4]) {
     LlamaData *priv = (LlamaData *)session;
     switch (cmd) {
@@ -620,7 +719,7 @@ void TA_DestroyEntryPoint(void) {
 TEE_Result TA_OpenSessionEntryPoint(uint32_t param_types, TEE_Param params[4], void **session) {
     const uint32_t expected_pt = TEE_PARAM_TYPES(
         TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_MEMREF_INPUT,
-        TEE_PARAM_TYPE_VALUE_OUTPUT, TEE_PARAM_TYPE_NONE);
+        TEE_PARAM_TYPE_VALUE_OUTPUT, TEE_PARAM_TYPE_MEMREF_INPUT);
     if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
     if (params[1].memref.size != sizeof(SamplerConfig)) { return TEE_ERROR_BAD_PARAMETERS; }
 
@@ -629,9 +728,22 @@ TEE_Result TA_OpenSessionEntryPoint(uint32_t param_types, TEE_Param params[4], v
     if (priv == NULL) { return TEE_ERROR_OUT_OF_MEMORY; }
     *session = priv;
 
-    // build the Transformer via the model .bin file
+    // load model .bin file into @data and @data_sz
+    TEE_Result res;
+    void *data = NULL;
+    size_t data_sz = 0;
+    if (params[0].memref.size > 0) {
+        res = create_secure_storage(params[3], params[0], &data, &data_sz);
+    } else {
+        res = read_secure_storage(params[3], &data, &data_sz);
+    }
+    if (res != TEE_SUCCESS) {
+        free(priv);
+        return res;
+    }
+    // build the Transformer via @data and @data_sz
     Transformer *transformer = &priv->transformer;
-    build_transformer(transformer, params[0].memref.buffer);
+    build_transformer(transformer, data, data_sz);
 
     // build the Sampler
     SamplerConfig *config = (SamplerConfig *)params[1].memref.buffer;
