@@ -598,48 +598,92 @@ static TEE_Result generate(Transformer *transformer, Sampler *sampler,
 typedef struct {
     Transformer transformer;
     Sampler sampler;
+    // bounce buffer used in read_secure_storage()
+    void *data;
+    size_t data_sz;
 } LlamaData;
 
-// use @id and @bin to save model to secure storage, and return ephemeral buffer with @data_p and @data_sz_p
-static TEE_Result create_secure_storage(TEE_Param id, TEE_Param bin, void **data_p, size_t *data_sz_p) {
-    size_t obj_id_sz = id.memref.size;
+static TEE_Result create_secure_storage(uint32_t param_types, TEE_Param params[4]) {
+    const uint32_t expected_pt = TEE_PARAM_TYPES(
+        TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_NONE,
+        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+    if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
+
+    size_t obj_id_sz = params[0].memref.size;
     char *obj_id = malloc(obj_id_sz);
     if (!obj_id) return TEE_ERROR_OUT_OF_MEMORY;
-    memcpy(obj_id, id.memref.buffer, obj_id_sz);
+    memcpy(obj_id, params[0].memref.buffer, obj_id_sz);
 
-    size_t data_sz = ROUNDUP(bin.memref.size, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
-    void *data = system_alloc(data_sz);
-    TEE_Result res;
-    if (!data) {
-        res = TEE_ERROR_OUT_OF_MEMORY;
-        goto free_obj;
-    }
-    memcpy(data, bin.memref.buffer, bin.memref.size);
-
-	uint32_t obj_data_flag = TEE_DATA_FLAG_ACCESS_READ |	// we can later read the oject
-			TEE_DATA_FLAG_ACCESS_WRITE |		// we can later write into the object
-			TEE_DATA_FLAG_ACCESS_WRITE_META |	// we can later destroy or rename the object
-			TEE_DATA_FLAG_OVERWRITE;		// destroy existing object of same ID
+	uint32_t obj_data_flag = TEE_DATA_FLAG_SHARE_READ |
+			TEE_DATA_FLAG_SHARE_WRITE |
+			TEE_DATA_FLAG_OVERWRITE;
 	TEE_ObjectHandle object = TEE_HANDLE_NULL;
-	res = TEE_CreatePersistentObject(TEE_STORAGE_PRIVATE,
+	TEE_Result res = TEE_CreatePersistentObject(TEE_STORAGE_PRIVATE,
 					obj_id, obj_id_sz,
 					obj_data_flag,
 					TEE_HANDLE_NULL,
-					data, data_sz,
+					NULL, 0,
 					&object);
 	if (res != TEE_SUCCESS) {
 		EMSG("TEE_CreatePersistentObject failed 0x%08x", res);
-		goto free_data;
+        goto free_id;
 	}
 
-    *data_p = data;
-    *data_sz_p = data_sz;
     TEE_CloseObject(object);
+free_id:
     free(obj_id);
-    return TEE_SUCCESS;
-free_data:
-    system_free(data, data_sz);
-free_obj:
+    return res;
+}
+
+static TEE_Result append_secure_storage(LlamaData *priv, uint32_t param_types, TEE_Param params[4]) {
+    const uint32_t expected_pt = TEE_PARAM_TYPES(
+        TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_MEMREF_INPUT,
+        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+    if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
+
+    const size_t data_sz = params[1].memref.size;
+    if (!priv->data) {
+        priv->data_sz = ROUNDUP(data_sz, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
+        priv->data = system_alloc(priv->data_sz);
+        if (!priv->data) {
+            priv->data_sz = 0;
+            return TEE_ERROR_OUT_OF_MEMORY;
+        }
+    }
+    if (data_sz > priv->data_sz) { return TEE_ERROR_BAD_PARAMETERS; }
+    memcpy(priv->data, params[1].memref.buffer, data_sz);
+
+    size_t obj_id_sz = params[0].memref.size;
+    char *obj_id = malloc(obj_id_sz);
+    if (!obj_id) return TEE_ERROR_OUT_OF_MEMORY;
+    memcpy(obj_id, params[0].memref.buffer, obj_id_sz);
+
+	TEE_ObjectHandle object = TEE_HANDLE_NULL;
+    TEE_Result res = TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
+					obj_id, obj_id_sz,
+					TEE_DATA_FLAG_ACCESS_WRITE |
+                    TEE_DATA_FLAG_SHARE_WRITE,
+					&object);
+	if (res != TEE_SUCCESS) {
+		EMSG("Failed to open persistent object, res=0x%08x", res);
+		goto free_id;
+	}
+
+    res = TEE_SeekObjectData(object, 0, TEE_DATA_SEEK_END);
+    if (res != TEE_SUCCESS) {
+		EMSG("TEE_SeekObjectData failed 0x%08x", res);
+        goto  close_obj;
+    }
+
+    res = TEE_WriteObjectData(object, priv->data, data_sz);
+	if (res != TEE_SUCCESS) {
+		EMSG("TEE_WriteObjectData failed 0x%08x", res);
+        goto  close_obj;
+    }
+
+close_obj:
+	TEE_CloseObject(object);
+free_id:    
     free(obj_id);
     return res;
 }
@@ -696,11 +740,48 @@ free_id:
     return res;
 }
 
+static TEE_Result init_model_with_storage(LlamaData *priv, uint32_t param_types, TEE_Param params[4]) {
+    const uint32_t expected_pt = TEE_PARAM_TYPES(
+        TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_MEMREF_INPUT,
+        TEE_PARAM_TYPE_VALUE_OUTPUT, TEE_PARAM_TYPE_NONE);
+    if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
+    if (params[1].memref.size != sizeof(SamplerConfig)) { return TEE_ERROR_BAD_PARAMETERS; }
+
+    // release memory ASAP
+    if (priv->data) {
+        system_free(priv->data, priv->data_sz);
+        priv->data = NULL;
+        priv->data_sz = 0;
+    }
+
+    void *data = NULL;
+    size_t data_sz = 0;
+    TEE_Result res = read_secure_storage(params[0], &data, &data_sz);
+    if (res != TEE_SUCCESS) { return res; }
+
+    // build the Transformer via @data and @data_sz
+    Transformer *transformer = &priv->transformer;
+    build_transformer(transformer, data, data_sz);
+
+    // build the Sampler
+    SamplerConfig *config = (SamplerConfig *)params[1].memref.buffer;
+    build_sampler(&priv->sampler, transformer->config.vocab_size, config->temperature, config->topp, config->rng_seed);
+
+    params[2].value.a = transformer->config.vocab_size;
+    return res;
+}
+
 TEE_Result TA_InvokeCommandEntryPoint(void *session, uint32_t cmd, uint32_t param_types, TEE_Param params[4]) {
     LlamaData *priv = (LlamaData *)session;
     switch (cmd) {
 	case TA_LLAMA_CMD_GENERATE:
 		return generate(&priv->transformer, &priv->sampler, param_types, params);
+    case TA_LLAMA_CMD_MODEL_STORAGE_CREATE:
+        return create_secure_storage(param_types, params);
+    case TA_LLAMA_CMD_MODEL_STORAGE_APPEND:
+        return append_secure_storage(priv, param_types, params);
+    case TA_LLAMA_CMD_INIT_MODEL_WITH_STORAGE:
+        return init_model_with_storage(priv, param_types, params);
 	default:
 		EMSG("Command ID 0x%x is not supported", cmd);
 		return TEE_ERROR_NOT_SUPPORTED;
@@ -716,40 +797,13 @@ void TA_DestroyEntryPoint(void) {
 	/* Nothing to do */
 }
 
-TEE_Result TA_OpenSessionEntryPoint(uint32_t param_types, TEE_Param params[4], void **session) {
-    const uint32_t expected_pt = TEE_PARAM_TYPES(
-        TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_MEMREF_INPUT,
-        TEE_PARAM_TYPE_VALUE_OUTPUT, TEE_PARAM_TYPE_MEMREF_INPUT);
-    if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
-    if (params[1].memref.size != sizeof(SamplerConfig)) { return TEE_ERROR_BAD_PARAMETERS; }
-
+TEE_Result TA_OpenSessionEntryPoint(uint32_t __unused param_types, TEE_Param __unused params[4], void **session) {
     // start allocating session data
     LlamaData *priv = malloc(sizeof(LlamaData));
     if (priv == NULL) { return TEE_ERROR_OUT_OF_MEMORY; }
+    priv->data = NULL;
+    priv->data_sz = 0;
     *session = priv;
-
-    // load model .bin file into @data and @data_sz
-    TEE_Result res;
-    void *data = NULL;
-    size_t data_sz = 0;
-    if (params[0].memref.size > 0) {
-        res = create_secure_storage(params[3], params[0], &data, &data_sz);
-    } else {
-        res = read_secure_storage(params[3], &data, &data_sz);
-    }
-    if (res != TEE_SUCCESS) {
-        free(priv);
-        return res;
-    }
-    // build the Transformer via @data and @data_sz
-    Transformer *transformer = &priv->transformer;
-    build_transformer(transformer, data, data_sz);
-
-    // build the Sampler
-    SamplerConfig *config = (SamplerConfig *)params[1].memref.buffer;
-    build_sampler(&priv->sampler, transformer->config.vocab_size, config->temperature, config->topp, config->rng_seed);
-
-    params[2].value.a = transformer->config.vocab_size;
     return TEE_SUCCESS;
 }
 

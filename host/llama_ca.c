@@ -6,6 +6,8 @@
 #include <time.h>
 #include <string.h>
 #include <fcntl.h>
+#include <assert.h>
+#include <sys/param.h>
 #if defined _WIN32
     #include "win.h"
 #else
@@ -14,42 +16,6 @@
 #endif
 #include <tee_client_api.h>
 #include <llama_ta.h>
-// ----------------------------------------------------------------------------
-// TEEC_SharedMemory acquire/release helper
-
-TEEC_SharedMemory *build_promise(TEEC_Context *ctx, char *path) {
-    // figure out the file size
-    FILE *file = fopen(path, "rb");
-    if (!file) { fprintf(stderr, "Couldn't open file %s\n", path); exit(EXIT_FAILURE); }
-    fseek(file, 0, SEEK_END); // move file pointer to end of file
-    ssize_t file_size = ftell(file); // get the file size, in bytes
-    fclose(file);
-
-    // create mmap handle
-    int fd = open(path, O_RDONLY); // open in read only mode
-    if (fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
-    void *data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
-
-    TEEC_SharedMemory *promise = malloc(sizeof(*promise));
-    promise->size = file_size;
-    promise->flags = TEEC_MEM_INPUT;
-    TEEC_Result res = TEEC_AllocateSharedMemory(ctx, promise);
-	if (res != TEEC_SUCCESS) {
-		fprintf(stderr, "TEEC_AllocateSharedMemory failed with code 0x%x\n", res);
-        exit(EXIT_FAILURE);
-    }
-    memcpy(promise->buffer, data, promise->size);
-    munmap(data, file_size);
-    close(fd);
-    return promise;
-}
-
-void free_promise(TEEC_SharedMemory *promise) {
-    TEEC_ReleaseSharedMemory(promise);
-    free(promise);
-}
-
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
 
@@ -329,35 +295,88 @@ void generate(TEEC_Context *ctx, TEEC_Session *sess, Tokenizer *tokenizer, char 
 // CLI, include only if not testing
 #ifndef TESTING
 
-void build_operation(TEEC_SharedMemory *model_bin, SamplerConfig *config,
-                     char *model_id, TEEC_Operation *op) {
-    op->params[1].tmpref.buffer = config;
-    op->params[1].tmpref.size = sizeof(*config);
-    op->params[3].tmpref.buffer = model_id;
-    op->params[3].tmpref.size = strlen(model_id);
-    if (model_bin) {
-        op->params[0].memref.parent = model_bin;
-        op->params[0].memref.offset = 0;
-        op->params[0].memref.size = model_bin->size;
-        op->paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_WHOLE, TEEC_MEMREF_TEMP_INPUT,
-                                            TEEC_VALUE_OUTPUT, TEEC_MEMREF_TEMP_INPUT);
-    } else {
-        op->params[0].tmpref.buffer = NULL;
-        op->params[0].tmpref.size = 0;
-        op->paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT, TEEC_MEMREF_TEMP_INPUT,
-                                            TEEC_VALUE_OUTPUT, TEEC_MEMREF_TEMP_INPUT);
+void create_storage(TEEC_Session *sess, char *model_id) {
+    TEEC_Operation op = {
+        .params[0].tmpref.buffer = model_id,
+        .params[0].tmpref.size = strlen(model_id),
+        .paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT, TEEC_NONE,
+                                       TEEC_NONE, TEEC_NONE)
+    };
+    uint32_t err_origin;
+    TEEC_Result res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_MODEL_STORAGE_CREATE, &op, &err_origin);
+    if (res != TEEC_SUCCESS) {
+        fprintf(stderr, "TA_LLAMA_CMD_MODEL_STORAGE_CREATE failed with code 0x%x origin 0x%x\n", res, err_origin);
+        exit(EXIT_FAILURE);
     }
 }
 
-int open_ca_session(TEEC_Session *sess, TEEC_Context *ctx, TEEC_SharedMemory *model_bin,
-                    SamplerConfig *config, char *model_id) {
-    TEEC_UUID uuid = TA_LLAMA_UUID;
-    TEEC_Operation op;
-    build_operation(model_bin, config, model_id, &op);
-    uint32_t err_origin;
-    TEEC_Result res = TEEC_OpenSession(ctx, sess, &uuid, TEEC_LOGIN_PUBLIC, NULL, &op, &err_origin);
+void batch_write_storage(TEEC_Context *ctx, TEEC_Session *sess, char *model_id, FILE *file) {
+    // if SHM_MAX_SIZE equals to TEEC_CONFIG_SHAREDMEM_MAX_SIZE, TEEC_AllocateSharedMemory will return out
+    // -of-memory when writing stories15M.bin model 
+    const size_t SHM_MAX_SIZE = 0x40000;
+    assert(SHM_MAX_SIZE <= TEEC_CONFIG_SHAREDMEM_MAX_SIZE);
+
+    fseek(file, 0, SEEK_END); // move file pointer to end of file
+    ssize_t file_size = ftell(file); // get the file size, in bytes
+    if (file_size < 0) { fprintf(stderr, "ftell failed!\n"); exit(EXIT_FAILURE); }
+    size_t remain_size = file_size;
+    fseek(file, 0, SEEK_SET); // move file pointer to begin of file
+
+    size_t batch_size = MIN(remain_size, SHM_MAX_SIZE);
+    TEEC_SharedMemory shm;
+    shm.size = batch_size;
+    shm.flags = TEEC_MEM_INPUT;
+    TEEC_Result res = TEEC_AllocateSharedMemory(ctx, &shm);
 	if (res != TEEC_SUCCESS) {
-		fprintf(stderr, "TEEC_Opensession failed with code 0x%x origin 0x%x\n", res, err_origin);
+		fprintf(stderr, "TEEC_AllocateSharedMemory failed with code 0x%x\n", res);
+        exit(EXIT_FAILURE);
+    }
+
+    while (remain_size) {
+        fread(shm.buffer, 1, batch_size, file);
+        TEEC_Operation op = {
+            .params[0].tmpref.buffer = model_id,
+            .params[0].tmpref.size = strlen(model_id),
+            .params[1].memref.parent = &shm,
+            .params[1].memref.offset = 0,
+            .params[1].memref.size = batch_size,
+            .paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT, TEEC_MEMREF_WHOLE,
+                                           TEEC_NONE, TEEC_NONE)
+        };
+        uint32_t err_origin;
+        res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_MODEL_STORAGE_APPEND, &op, &err_origin);
+        if (res != TEEC_SUCCESS) {
+            fprintf(stderr, "TA_LLAMA_CMD_MODEL_STORAGE_APPEND failed with code 0x%x origin 0x%x\n", res, err_origin);
+            exit(EXIT_FAILURE);
+        }
+        remain_size -= batch_size;
+        batch_size = MIN(remain_size, SHM_MAX_SIZE);
+    }
+
+    TEEC_ReleaseSharedMemory(&shm);
+}
+
+void send_model_to_tee(TEEC_Context *ctx, TEEC_Session *sess, char *model_id, char *checkpoint_path) {
+    FILE *file = fopen(checkpoint_path, "rb");
+    if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint_path); exit(EXIT_FAILURE); }
+    create_storage(sess, model_id);
+    batch_write_storage(ctx, sess, model_id, file);
+    fclose(file);
+}
+
+int init_generate_ctx(TEEC_Session *sess, char *model_id, SamplerConfig *config) {
+    TEEC_Operation op = {
+        .params[0].tmpref.buffer = model_id,
+        .params[0].tmpref.size = strlen(model_id),
+        .params[1].tmpref.buffer = config,
+        .params[1].tmpref.size = sizeof(*config),
+        .paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT, TEEC_MEMREF_TEMP_INPUT,
+                                       TEEC_VALUE_OUTPUT, TEEC_NONE)
+    };
+    uint32_t err_origin;
+    TEEC_Result res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_INIT_MODEL_WITH_STORAGE, &op, &err_origin);
+    if (res != TEEC_SUCCESS) {
+        fprintf(stderr, "TA_LLAMA_CMD_INIT_MODEL_WITH_STORAGE failed with code 0x%x origin 0x%x\n", res, err_origin);
         exit(EXIT_FAILURE);
     }
     return op.params[2].value.a;
@@ -425,14 +444,20 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // send model .bin file to TEE via TEEC_SharedMemory
-    TEEC_SharedMemory *model_bin = NULL;
-    if (checkpoint_path) {
-        model_bin = build_promise(&ctx, checkpoint_path);
+	TEEC_Session sess;
+    TEEC_UUID uuid = TA_LLAMA_UUID;
+    uint32_t err_origin;
+    res = TEEC_OpenSession(&ctx, &sess, &uuid, TEEC_LOGIN_PUBLIC, NULL, NULL, &err_origin);
+	if (res != TEEC_SUCCESS) {
+		fprintf(stderr, "TEEC_Opensession failed with code 0x%x origin 0x%x\n", res, err_origin);
+        exit(EXIT_FAILURE);
     }
 
-	TEEC_Session sess;
-    int vocab_size = open_ca_session(&sess, &ctx, model_bin, &sampler_config, model_id);
+    // send model .bin file to TEE
+    if (checkpoint_path) {
+        send_model_to_tee(&ctx, &sess, model_id, checkpoint_path);
+    }
+    int vocab_size = init_generate_ctx(&sess, model_id, &sampler_config);
 
     // build the Tokenizer via the tokenizer .bin file
     Tokenizer tokenizer;
@@ -443,7 +468,6 @@ int main(int argc, char *argv[]) {
 
     // clean up handles
     free_tokenizer(&tokenizer);
-    free_promise(model_bin);
 
     // destroy TEE context & session
     TEEC_CloseSession(&sess);
