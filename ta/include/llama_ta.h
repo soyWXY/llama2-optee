@@ -52,3 +52,30 @@ static void __attribute__((unused)) build_sampler_config(SamplerConfig* config, 
  * param[3] unused
  */
 #define TA_LLAMA_CMD_INIT_MODEL_WITH_STORAGE 3
+
+/*
+ * TA_LLAMA_CMD_MODEL_MEM_CREATE - allocate memory buffer
+ * param[0] (value.a) in: required buffer size
+ * param[1] unused
+ * param[2] unused
+ * param[3] unused
+ */
+#define TA_LLAMA_CMD_MODEL_MEM_CREATE 4
+
+/*
+ * TA_LLAMA_CMD_MODEL_MEM_APPEND - write to memory buffer allocated by TA_LLAMA_CMD_MODEL_MEM_CREATE
+ * param[0] (memref) in: data to append to object
+ * param[1] unused
+ * param[2] unused
+ * param[3] unused
+ */
+#define TA_LLAMA_CMD_MODEL_MEM_APPEND 5
+
+/*
+ * TA_LLAMA_CMD_INIT_MODEL_WITH_MEM - read model from memory buffer
+ * param[0] (memref) in: SamplerConfig
+ * param[1] (value.a) out: return transformer.config.vocab_size
+ * param[2] unused
+ * param[3] unused
+ */
+#define TA_LLAMA_CMD_INIT_MODEL_WITH_MEM 6

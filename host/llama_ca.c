@@ -356,41 +356,95 @@ void batch_write_storage(TEEC_Context *ctx, TEEC_Session *sess, char *model_id, 
     TEEC_ReleaseSharedMemory(&shm);
 }
 
-void send_model_to_tee(TEEC_Context *ctx, TEEC_Session *sess, char *model_id, char *checkpoint_path) {
+void create_mem(TEEC_Session *sess, size_t file_size) {
+    TEEC_Operation op = {
+        .params[0].value.a = file_size,
+        .paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE,
+                                       TEEC_NONE, TEEC_NONE)
+    };
+    uint32_t err_origin;
+    TEEC_Result res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_MODEL_MEM_CREATE, &op, &err_origin);
+    if (res != TEEC_SUCCESS) {
+        fprintf(stderr, "TA_LLAMA_CMD_MODEL_MEM_CREATE failed with code 0x%x origin 0x%x\n", res, err_origin);
+        exit(EXIT_FAILURE);
+    }
+}
+
+void batch_write_mem(TEEC_Context *ctx, TEEC_Session *sess, FILE *file, size_t file_size) {
+    // if SHM_MAX_SIZE equals to TEEC_CONFIG_SHAREDMEM_MAX_SIZE, TEEC_AllocateSharedMemory will return out
+    // -of-memory when writing stories15M.bin model 
+    const size_t SHM_MAX_SIZE = 0x40000;
+    assert(SHM_MAX_SIZE <= TEEC_CONFIG_SHAREDMEM_MAX_SIZE);
+
+    size_t remain_size = file_size;
+    size_t batch_size = MIN(remain_size, SHM_MAX_SIZE);
+    TEEC_SharedMemory shm;
+    shm.size = batch_size;
+    shm.flags = TEEC_MEM_INPUT;
+    TEEC_Result res = TEEC_AllocateSharedMemory(ctx, &shm);
+	if (res != TEEC_SUCCESS) {
+		fprintf(stderr, "TEEC_AllocateSharedMemory failed with code 0x%x\n", res);
+        exit(EXIT_FAILURE);
+    }
+
+    while (remain_size) {
+        fread(shm.buffer, 1, batch_size, file);
+        TEEC_Operation op = {
+            .params[0].memref.parent = &shm,
+            .params[0].memref.offset = 0,
+            .params[0].memref.size = batch_size,
+            .paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_PARTIAL_INPUT, TEEC_NONE,
+                                           TEEC_NONE, TEEC_NONE)
+        };
+        uint32_t err_origin;
+        res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_MODEL_MEM_APPEND, &op, &err_origin);
+        if (res != TEEC_SUCCESS) {
+            fprintf(stderr, "TA_LLAMA_CMD_MODEL_MEM_APPEND failed with code 0x%x origin 0x%x\n", res, err_origin);
+            exit(EXIT_FAILURE);
+        }
+        remain_size -= batch_size;
+        batch_size = MIN(remain_size, SHM_MAX_SIZE);
+    }
+
+    TEEC_ReleaseSharedMemory(&shm);
+}
+
+void send_model_to_tee(TEEC_Context *ctx, TEEC_Session *sess, char *checkpoint_path) {
     FILE *file = fopen(checkpoint_path, "rb");
     if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint_path); exit(EXIT_FAILURE); }
-    create_storage(sess, model_id);
-    batch_write_storage(ctx, sess, model_id, file);
+    fseek(file, 0, SEEK_END); // move file pointer to end of file
+    ssize_t file_size = ftell(file); // get the file size, in bytes
+    if (file_size < 0) { fprintf(stderr, "ftell failed!\n"); exit(EXIT_FAILURE); }
+    fseek(file, 0, SEEK_SET); // move file pointer to begin of file
+    create_mem(sess, file_size);
+    batch_write_mem(ctx, sess, file, file_size);
     fclose(file);
 }
 
-int init_generate_ctx(TEEC_Session *sess, char *model_id, SamplerConfig *config) {
+int init_generate_ctx(TEEC_Session *sess, SamplerConfig *config) {
     TEEC_Operation op = {
-        .params[0].tmpref.buffer = model_id,
-        .params[0].tmpref.size = strlen(model_id),
-        .params[1].tmpref.buffer = config,
-        .params[1].tmpref.size = sizeof(*config),
-        .paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT, TEEC_MEMREF_TEMP_INPUT,
-                                       TEEC_VALUE_OUTPUT, TEEC_NONE)
+        .params[0].tmpref.buffer = config,
+        .params[0].tmpref.size = sizeof(*config),
+        .paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT, TEEC_VALUE_OUTPUT,
+                                       TEEC_NONE, TEEC_NONE)
     };
     uint32_t err_origin;
-    TEEC_Result res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_INIT_MODEL_WITH_STORAGE, &op, &err_origin);
+    TEEC_Result res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_INIT_MODEL_WITH_MEM, &op, &err_origin);
     if (res != TEEC_SUCCESS) {
-        fprintf(stderr, "TA_LLAMA_CMD_INIT_MODEL_WITH_STORAGE failed with code 0x%x origin 0x%x\n", res, err_origin);
+        fprintf(stderr, "TA_LLAMA_CMD_INIT_MODEL_WITH_MEM failed with code 0x%x origin 0x%x\n", res, err_origin);
         exit(EXIT_FAILURE);
     }
-    return op.params[2].value.a;
+    return op.params[1].value.a;
 }
 
 void error_usage() {
-    fprintf(stderr, "Usage:   run <model id> [options]\n");
+    fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
     fprintf(stderr, "Example: run model.bin -n 256 -i \"Once upon a time\"\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
     fprintf(stderr, "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
-    fprintf(stderr, "  -m <string> checkpoint path\n");
     fprintf(stderr, "  -i <string> input prompt\n");
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
     exit(EXIT_FAILURE);
@@ -399,7 +453,6 @@ void error_usage() {
 int main(int argc, char *argv[]) {
 
     // default parameters
-    char *model_id = NULL;
     char *checkpoint_path = NULL;  // e.g. out/model.bin
     char *tokenizer_path = "tokenizer.bin";
     float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
@@ -409,7 +462,7 @@ int main(int argc, char *argv[]) {
     unsigned long long rng_seed = 0; // seed rng with time by default
 
     // poor man's C argparse so we can override the defaults above from the command line
-    if (argc >= 2) { model_id = argv[1]; } else { error_usage(); }
+    if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
     for (int i = 2; i < argc; i+=2) {
         // do some basic validation
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
@@ -420,7 +473,6 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'p') { topp = atof(argv[i + 1]); }
         else if (argv[i][1] == 's') { rng_seed = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'n') { steps = atoi(argv[i + 1]); }
-        else if (argv[i][1] == 'm') { checkpoint_path = argv[i + 1]; }
         else if (argv[i][1] == 'i') { prompt = argv[i + 1]; }
         else if (argv[i][1] == 'z') { tokenizer_path = argv[i + 1]; }
         else { error_usage(); }
@@ -454,10 +506,8 @@ int main(int argc, char *argv[]) {
     }
 
     // send model .bin file to TEE
-    if (checkpoint_path) {
-        send_model_to_tee(&ctx, &sess, model_id, checkpoint_path);
-    }
-    int vocab_size = init_generate_ctx(&sess, model_id, &sampler_config);
+    send_model_to_tee(&ctx, &sess, checkpoint_path);
+    int vocab_size = init_generate_ctx(&sess, &sampler_config);
 
     // build the Tokenizer via the tokenizer .bin file
     Tokenizer tokenizer;

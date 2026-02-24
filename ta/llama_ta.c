@@ -417,6 +417,7 @@ typedef struct {
 typedef struct {
     int vocab_size;
     ProbIndex* probindex; // buffer used in top-p sampling
+    size_t probindex_sz;
     float temperature;
     float topp;
     unsigned long long rng_state;
@@ -505,11 +506,13 @@ static void build_sampler(Sampler* sampler, int vocab_size, float temperature, f
     sampler->topp = topp;
     sampler->rng_state = rng_seed;
     // buffer only used with nucleus sampling; may not need but it's ~small
-    sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
+    size_t sz = sampler->vocab_size * sizeof(ProbIndex);
+    sampler->probindex_sz = ROUNDUP(sz, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
+    sampler->probindex = system_alloc(sampler->probindex_sz);
 }
 
 static void free_sampler(Sampler* sampler) {
-    free(sampler->probindex);
+    system_free(sampler->probindex, sampler->probindex_sz);
 }
 
 static unsigned int random_u32(unsigned long long *state) {
@@ -601,6 +604,10 @@ typedef struct {
     // bounce buffer used in read_secure_storage()
     void *data;
     size_t data_sz;
+    // model used in append_model_mem()
+    void *model;
+    size_t model_capacity;
+    size_t model_size;
 } LlamaData;
 
 static TEE_Result create_secure_storage(uint32_t param_types, TEE_Param params[4]) {
@@ -771,6 +778,57 @@ static TEE_Result init_model_with_storage(LlamaData *priv, uint32_t param_types,
     return res;
 }
 
+static TEE_Result create_model_mem(LlamaData *priv, uint32_t param_types, TEE_Param params[4]) {
+    const uint32_t expected_pt = TEE_PARAM_TYPES(
+        TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_NONE,
+        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+    if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
+
+    size_t sz = params[0].value.a;
+    sz = ROUNDUP(sz, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
+    void *p = system_alloc(sz);
+    if (!p) { return TEE_ERROR_OUT_OF_MEMORY; }
+    priv->model = p;
+    priv->model_capacity = sz;
+    priv->model_size = 0;
+    return TEE_SUCCESS;
+}
+
+static TEE_Result append_model_mem(LlamaData *priv, uint32_t param_types, TEE_Param params[4]) {
+    const uint32_t expected_pt = TEE_PARAM_TYPES(
+        TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_NONE,
+        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+    if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
+
+    const size_t data_sz = params[0].memref.size;
+    if (priv->model_size + data_sz > priv->model_capacity) { return TEE_ERROR_SHORT_BUFFER; }
+    memcpy((char*)priv->model + priv->model_size, params[0].memref.buffer, data_sz);
+    priv->model_size += data_sz;
+    return TEE_SUCCESS;
+}
+
+static TEE_Result init_model_with_mem(LlamaData *priv, uint32_t param_types, TEE_Param params[4]) {
+    const uint32_t expected_pt = TEE_PARAM_TYPES(
+        TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_VALUE_OUTPUT,
+        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+    if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
+    if (params[0].memref.size != sizeof(SamplerConfig)) { return TEE_ERROR_BAD_PARAMETERS; }
+
+    // build the Transformer
+    Transformer *transformer = &priv->transformer;
+    build_transformer(transformer, priv->model, priv->model_capacity);
+    priv->model = NULL;
+    priv->model_capacity = 0;
+    priv->model_size = 0;
+
+    // build the Sampler
+    SamplerConfig *config = (SamplerConfig *)params[0].memref.buffer;
+    build_sampler(&priv->sampler, transformer->config.vocab_size, config->temperature, config->topp, config->rng_seed);
+
+    params[1].value.a = transformer->config.vocab_size;
+    return TEE_SUCCESS;
+}
+
 TEE_Result TA_InvokeCommandEntryPoint(void *session, uint32_t cmd, uint32_t param_types, TEE_Param params[4]) {
     LlamaData *priv = (LlamaData *)session;
     switch (cmd) {
@@ -782,6 +840,12 @@ TEE_Result TA_InvokeCommandEntryPoint(void *session, uint32_t cmd, uint32_t para
         return append_secure_storage(priv, param_types, params);
     case TA_LLAMA_CMD_INIT_MODEL_WITH_STORAGE:
         return init_model_with_storage(priv, param_types, params);
+    case TA_LLAMA_CMD_MODEL_MEM_CREATE:
+        return create_model_mem(priv, param_types, params);
+    case TA_LLAMA_CMD_MODEL_MEM_APPEND:
+        return append_model_mem(priv, param_types, params);
+    case TA_LLAMA_CMD_INIT_MODEL_WITH_MEM:
+        return init_model_with_mem(priv, param_types, params);
 	default:
 		EMSG("Command ID 0x%x is not supported", cmd);
 		return TEE_ERROR_NOT_SUPPORTED;
@@ -803,6 +867,9 @@ TEE_Result TA_OpenSessionEntryPoint(uint32_t __unused param_types, TEE_Param __u
     if (priv == NULL) { return TEE_ERROR_OUT_OF_MEMORY; }
     priv->data = NULL;
     priv->data_sz = 0;
+    priv->model = NULL;
+    priv->model_capacity = 0;
+    priv->model_size = 0;
     *session = priv;
     return TEE_SUCCESS;
 }
