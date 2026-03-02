@@ -7,6 +7,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <assert.h>
+#include <omp.h>
 #include <sys/param.h>
 #if defined _WIN32
     #include "win.h"
@@ -295,6 +296,12 @@ void generate(TEEC_Context *ctx, TEEC_Session *sess, Tokenizer *tokenizer, char 
 // CLI, include only if not testing
 #ifndef TESTING
 
+struct ModelBinaryHeader {
+    uint32_t file_size;
+    uint32_t nblock;
+    uint32_t intervals[];
+};
+
 void create_storage(TEEC_Session *sess, char *model_id) {
     TEEC_Operation op = {
         .params[0].tmpref.buffer = model_id,
@@ -370,55 +377,86 @@ void create_mem(TEEC_Session *sess, size_t file_size) {
     }
 }
 
-void batch_write_mem(TEEC_Context *ctx, TEEC_Session *sess, FILE *file, size_t file_size) {
+void batch_transfer_mem(int tid, TEEC_Context *ctx, TEEC_Session *sess, struct ModelBinaryHeader *header, void *payload) {
     // if SHM_MAX_SIZE equals to TEEC_CONFIG_SHAREDMEM_MAX_SIZE, TEEC_AllocateSharedMemory will return out
     // -of-memory when writing stories15M.bin model 
     const size_t SHM_MAX_SIZE = 0x40000;
     assert(SHM_MAX_SIZE <= TEEC_CONFIG_SHAREDMEM_MAX_SIZE);
 
-    size_t remain_size = file_size;
-    size_t batch_size = MIN(remain_size, SHM_MAX_SIZE);
+    const size_t TAG_SZ = 16;
+
+    uint32_t cipher_begin = header->intervals[tid];
+    uint32_t cipher_end = header->intervals[tid + 1] - TAG_SZ;
+    const uint32_t plain_offset = cipher_begin - TAG_SZ * tid;
+    const uint32_t cipher_sz = cipher_end - cipher_begin;
+    void * const tag = payload + cipher_end;
+    uint32_t dst_offset = plain_offset;
+
+    size_t batch_size = MIN(cipher_end - cipher_begin, SHM_MAX_SIZE);
     TEEC_SharedMemory shm;
     shm.size = batch_size;
     shm.flags = TEEC_MEM_INPUT;
     TEEC_Result res = TEEC_AllocateSharedMemory(ctx, &shm);
-	if (res != TEEC_SUCCESS) {
-		fprintf(stderr, "TEEC_AllocateSharedMemory failed with code 0x%x\n", res);
+    if (res != TEEC_SUCCESS) {
+        fprintf(stderr, "TEEC_AllocateSharedMemory failed with code 0x%x\n", res);
         exit(EXIT_FAILURE);
     }
 
-    while (remain_size) {
-        fread(shm.buffer, 1, batch_size, file);
+    while (cipher_begin < cipher_end) {
+        memcpy(shm.buffer, payload + cipher_begin, batch_size);
         TEEC_Operation op = {
             .params[0].memref.parent = &shm,
             .params[0].memref.offset = 0,
             .params[0].memref.size = batch_size,
-            .paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_PARTIAL_INPUT, TEEC_NONE,
-                                           TEEC_NONE, TEEC_NONE)
+            .params[1].value.a = dst_offset,
+            .paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_PARTIAL_INPUT, TEEC_VALUE_INPUT,
+                                            TEEC_NONE, TEEC_NONE)
         };
         uint32_t err_origin;
-        res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_MODEL_MEM_APPEND, &op, &err_origin);
+        res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_MODEL_MEM_WRITE_AT, &op, &err_origin);
         if (res != TEEC_SUCCESS) {
-            fprintf(stderr, "TA_LLAMA_CMD_MODEL_MEM_APPEND failed with code 0x%x origin 0x%x\n", res, err_origin);
+            fprintf(stderr, "TA_LLAMA_CMD_MODEL_MEM_WRITE_AT failed with code 0x%x origin 0x%x\n", res, err_origin);
             exit(EXIT_FAILURE);
         }
-        remain_size -= batch_size;
-        batch_size = MIN(remain_size, SHM_MAX_SIZE);
+        dst_offset += batch_size;
+        cipher_begin += batch_size;
+        batch_size = MIN(cipher_end - cipher_begin, SHM_MAX_SIZE);
     }
 
     TEEC_ReleaseSharedMemory(&shm);
+
+    TEEC_Operation op = {
+        .params[0].value.a = plain_offset,
+        .params[0].value.b = cipher_sz,
+        .params[1].tmpref.buffer = tag,
+        .params[1].tmpref.size = TAG_SZ,
+        .paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_MEMREF_TEMP_INPUT,
+                                        TEEC_NONE, TEEC_NONE)
+    };
+    uint32_t err_origin;
+    res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_DECRYPT, &op, &err_origin);
+    if (res != TEEC_SUCCESS) {
+        fprintf(stderr, "TA_LLAMA_CMD_DECRYPT failed with code 0x%x origin 0x%x\n", res, err_origin);
+        exit(EXIT_FAILURE);
+    }
 }
 
-void send_model_to_tee(TEEC_Context *ctx, TEEC_Session *sess, char *checkpoint_path) {
+void *mmap_checkpoint(char *checkpoint_path, ssize_t *file_size) {
+    // query file size
     FILE *file = fopen(checkpoint_path, "rb");
     if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint_path); exit(EXIT_FAILURE); }
     fseek(file, 0, SEEK_END); // move file pointer to end of file
-    ssize_t file_size = ftell(file); // get the file size, in bytes
-    if (file_size < 0) { fprintf(stderr, "ftell failed!\n"); exit(EXIT_FAILURE); }
-    fseek(file, 0, SEEK_SET); // move file pointer to begin of file
-    create_mem(sess, file_size);
-    batch_write_mem(ctx, sess, file, file_size);
+    *file_size = ftell(file); // get the file size, in bytes
+    if (*file_size < 0) { fprintf(stderr, "ftell failed!\n"); exit(EXIT_FAILURE); }
     fclose(file);
+
+    // mmap file with file size
+    int fd = open(checkpoint_path, O_RDONLY); // open in read only mode
+    if (fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
+    void *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
+    close(fd);
+    return data;
 }
 
 int init_generate_ctx(TEEC_Session *sess, SamplerConfig *config) {
@@ -488,7 +526,7 @@ int main(int argc, char *argv[]) {
     SamplerConfig sampler_config;
     build_sampler_config(&sampler_config, temperature, topp, rng_seed);
 
-    // create TEE context & session
+    // create TEE context
 	TEEC_Context ctx;
     TEEC_Result res = TEEC_InitializeContext(NULL, &ctx);
 	if (res != TEEC_SUCCESS) {
@@ -496,32 +534,51 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-	TEEC_Session sess;
-    TEEC_UUID uuid = TA_LLAMA_UUID;
-    uint32_t err_origin;
-    res = TEEC_OpenSession(&ctx, &sess, &uuid, TEEC_LOGIN_PUBLIC, NULL, NULL, &err_origin);
-	if (res != TEEC_SUCCESS) {
-		fprintf(stderr, "TEEC_Opensession failed with code 0x%x origin 0x%x\n", res, err_origin);
-        exit(EXIT_FAILURE);
+    ssize_t file_size;
+    void *data = mmap_checkpoint(checkpoint_path, &file_size);
+    struct ModelBinaryHeader *header = (struct ModelBinaryHeader*)data;
+    #pragma omp parallel num_threads(header->nblock)
+    {
+        TEEC_Session sess;
+        TEEC_UUID uuid = TA_LLAMA_UUID;
+        uint32_t err_origin;
+        res = TEEC_OpenSession(&ctx, &sess, &uuid, TEEC_LOGIN_PUBLIC, NULL, NULL, &err_origin);
+        if (res != TEEC_SUCCESS) {
+            fprintf(stderr, "TEEC_Opensession failed with code 0x%x origin 0x%x\n", res, err_origin);
+            exit(EXIT_FAILURE);
+        }
+
+        #pragma omp single
+        create_mem(&sess, header->file_size);
+
+        // transfer file in batches
+        int tid = omp_get_thread_num();
+        void *payload = (char*)data + sizeof(struct ModelBinaryHeader) + (header->nblock + 1) * sizeof(uint32_t);
+        batch_transfer_mem(tid, &ctx, &sess, header, payload);
+        #pragma omp barrier
+
+        #pragma omp single nowait
+        {
+            int vocab_size = init_generate_ctx(&sess, &sampler_config);
+
+            // build the Tokenizer via the tokenizer .bin file
+            Tokenizer tokenizer;
+            build_tokenizer(&tokenizer, tokenizer_path, vocab_size);
+
+            // run!
+            generate(&ctx, &sess, &tokenizer, prompt, steps);
+
+            // clean up handles
+            free_tokenizer(&tokenizer);
+        }
+
+        TEEC_CloseSession(&sess);
     }
 
-    // send model .bin file to TEE
-    send_model_to_tee(&ctx, &sess, checkpoint_path);
-    int vocab_size = init_generate_ctx(&sess, &sampler_config);
+    munmap(data, file_size);
 
-    // build the Tokenizer via the tokenizer .bin file
-    Tokenizer tokenizer;
-    build_tokenizer(&tokenizer, tokenizer_path, vocab_size);
-
-    // run!
-    generate(&ctx, &sess, &tokenizer, prompt, steps);
-
-    // clean up handles
-    free_tokenizer(&tokenizer);
-
-    // destroy TEE context & session
-    TEEC_CloseSession(&sess);
-	TEEC_FinalizeContext(&ctx);
+    // destroy TEE context
+    TEEC_FinalizeContext(&ctx);
 
     return 0;
 }

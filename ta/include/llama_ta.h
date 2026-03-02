@@ -63,15 +63,6 @@ static void __attribute__((unused)) build_sampler_config(SamplerConfig* config, 
 #define TA_LLAMA_CMD_MODEL_MEM_CREATE 4
 
 /*
- * TA_LLAMA_CMD_MODEL_MEM_APPEND - write to memory buffer allocated by TA_LLAMA_CMD_MODEL_MEM_CREATE
- * param[0] (memref) in: data to append to object
- * param[1] unused
- * param[2] unused
- * param[3] unused
- */
-#define TA_LLAMA_CMD_MODEL_MEM_APPEND 5
-
-/*
  * TA_LLAMA_CMD_INIT_MODEL_WITH_MEM - read model from memory buffer
  * param[0] (memref) in: SamplerConfig
  * param[1] (value.a) out: return transformer.config.vocab_size
@@ -79,3 +70,22 @@ static void __attribute__((unused)) build_sampler_config(SamplerConfig* config, 
  * param[3] unused
  */
 #define TA_LLAMA_CMD_INIT_MODEL_WITH_MEM 6
+
+/*
+ * TA_LLAMA_CMD_MODEL_MEM_WRITE_AT - write to memory buffer allocated by TA_LLAMA_CMD_MODEL_MEM_CREATE
+ * param[0] (memref) in: data to append to object
+ * param[1] (value.a) in: memory offset to write at
+ * param[2] unused
+ * param[3] unused
+ */
+#define TA_LLAMA_CMD_MODEL_MEM_WRITE_AT 7
+
+/*
+ * TA_LLAMA_CMD_DECRYPT - decrypt designated region of memory
+ * param[0] (value.a) in: memory offset of the region
+ *          (value.b) in: size of the region
+ * param[1] (memref) in: tag of the ciphertext
+ * param[2] unused
+ * param[3] unused
+ */
+#define TA_LLAMA_CMD_DECRYPT 8

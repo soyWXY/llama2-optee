@@ -9,6 +9,8 @@ READELF ?= $(CROSS_COMPILE)readelf
 OBJS = llama_ca.o
 
 CFLAGS += -Wall -I../ta/include -I$(TEEC_EXPORT)/include -I./include
+CFLAGS += -fopenmp
+LDFLAGS += -fopenmp
 LDADD += -lteec -L$(TEEC_EXPORT)/lib
 LDADD += -lm
 
