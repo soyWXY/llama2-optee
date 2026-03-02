@@ -17,6 +17,20 @@
 #endif
 #include <tee_client_api.h>
 #include <llama_ta.h>
+
+#include <time.h>
+
+struct timespec start;
+void tick() {
+    clock_gettime(CLOCK_REALTIME, &start);
+}
+double tock() {
+    struct timespec end;
+    clock_gettime(CLOCK_REALTIME, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    return elapsed;
+}
+
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
 
@@ -489,7 +503,10 @@ int main(int argc, char *argv[]) {
         }
 
         #pragma omp single
-        create_mem(&sess, header->file_size);
+        {
+            tick();
+            create_mem(&sess, header->file_size);
+        }
 
         // transfer file in batches
         int tid = omp_get_thread_num();
@@ -499,14 +516,18 @@ int main(int argc, char *argv[]) {
 
         #pragma omp single nowait
         {
+            double t1 = tock();
             int vocab_size = init_generate_ctx(&sess, &sampler_config);
 
             // build the Tokenizer via the tokenizer .bin file
             Tokenizer tokenizer;
             build_tokenizer(&tokenizer, tokenizer_path, vocab_size);
-
+            
             // run!
+            tick();
             generate(&ctx, &sess, &tokenizer, prompt, steps);
+            double t2 = tock();
+            printf("transfer + decrypt: %f\ninference: %f\n", t1, t2);
 
             // clean up handles
             free_tokenizer(&tokenizer);
