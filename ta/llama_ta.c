@@ -807,12 +807,51 @@ static TEE_Result append_model_mem(LlamaData *priv, uint32_t param_types, TEE_Pa
     return TEE_SUCCESS;
 }
 
+static TEE_Result decrypt_model(void *model, size_t model_sz) {
+    static const uint8_t aes_256_key[32] = {0};
+    static const uint8_t fixed_iv[12] = {0};
+
+    TEE_OperationHandle op = TEE_HANDLE_NULL;
+    TEE_ObjectHandle key_obj = TEE_HANDLE_NULL;
+    TEE_Result res = TEE_AllocateOperation(&op, TEE_ALG_AES_GCM, TEE_MODE_DECRYPT, 256);
+    if (res != TEE_SUCCESS) return res;
+
+    res = TEE_AllocateTransientObject(TEE_TYPE_AES, 256, &key_obj);
+    if (res != TEE_SUCCESS) goto cleanup_op;
+
+    TEE_Attribute attr;
+    TEE_InitRefAttribute(&attr, TEE_ATTR_SECRET_VALUE, aes_256_key, sizeof(aes_256_key));
+    res = TEE_PopulateTransientObject(key_obj, &attr, 1);
+    if (res != TEE_SUCCESS) goto cleanup_key;
+
+    res = TEE_SetOperationKey(op, key_obj);
+    if (res != TEE_SUCCESS) goto cleanup_key;
+
+    res = TEE_AEInit(op, (void *)fixed_iv, sizeof(fixed_iv), 128, 0, 0);
+    if (res != TEE_SUCCESS) goto cleanup_key;
+
+    const size_t TAG_SZ = 16;
+    void *ciphertext = model;
+    size_t ct_len = model_sz - TAG_SZ;
+    uint8_t *tag = ((uint8_t *)model) + ct_len;
+    uint32_t pt_len = ct_len;
+    res = TEE_AEDecryptFinal(op, ciphertext, ct_len, ciphertext, &pt_len, tag, TAG_SZ);
+cleanup_key:
+    TEE_FreeTransientObject(key_obj);
+cleanup_op:
+    TEE_FreeOperation(op);
+    return res;
+}
+
 static TEE_Result init_model_with_mem(LlamaData *priv, uint32_t param_types, TEE_Param params[4]) {
     const uint32_t expected_pt = TEE_PARAM_TYPES(
         TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_VALUE_OUTPUT,
         TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
     if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
     if (params[0].memref.size != sizeof(SamplerConfig)) { return TEE_ERROR_BAD_PARAMETERS; }
+
+    TEE_Result res = decrypt_model(priv->model, priv->model_size);
+    if (res != TEE_SUCCESS) { return res; }
 
     // build the Transformer
     Transformer *transformer = &priv->transformer;
