@@ -81,12 +81,14 @@ static TEE_Result system_shm_close(void) {
 	return invoke_system_pta(PTA_SYSTEM_SHM_CLOSE, param_types, params);
 }
 
-static void* system_shm_mmap(void) {
+static void* system_shm_mmap(size_t size, size_t offset) {
     TEE_Param params[TEE_NUM_PARAMS];
 	params[0].value.a = SHM_KEY;
+	params[2].value.a = size;
+	params[2].value.b = offset;
 	uint32_t param_types = TEE_PARAM_TYPES(
         TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_VALUE_OUTPUT,
-        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+        TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_NONE);
 	TEE_Result res = invoke_system_pta(PTA_SYSTEM_SHM_MMAP, param_types, params);
     if (res != TEE_SUCCESS) {
 		EMSG("Failed to mmap shm: 0x%x", res);
@@ -659,6 +661,7 @@ typedef struct {
     size_t data_sz;
     // shm for write_at_model_mem() to concurrently write to
     void *model_shm;
+    int shm_offset;
 } LlamaData;
 
 static TEE_Result create_secure_storage(uint32_t param_types, TEE_Param params[4]) {
@@ -851,11 +854,10 @@ static TEE_Result decrypt_model_mem(LlamaData *priv, uint32_t param_types, TEE_P
         TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
     if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
 
-    const size_t offset = params[0].value.a;
-    const size_t ct_len = params[0].value.b;
+    const size_t ct_len = params[0].value.a;
     uint8_t *tag = params[1].memref.buffer;
     const size_t tag_sz = params[1].memref.size;
-    void *ciphertext = (char*)priv->model_shm + offset;
+    void *ciphertext = (char*)priv->model_shm + priv->shm_offset;
     uint32_t pt_len = ct_len;
 
     static const uint8_t aes_256_key[32] = {0};
@@ -897,6 +899,9 @@ static TEE_Result init_model_with_mem(LlamaData *priv, uint32_t param_types, TEE
 
     // build the Transformer
     Transformer *transformer = &priv->transformer;
+    system_shm_munmap(priv->model_shm);
+    priv->model_shm = system_shm_mmap(0, 0);
+    if (!priv->model_shm) { return TEE_ERROR_GENERIC; }
     build_transformer(transformer, priv->model_shm, 0);
 
     // build the Sampler
@@ -910,17 +915,23 @@ static TEE_Result init_model_with_mem(LlamaData *priv, uint32_t param_types, TEE
 static TEE_Result write_at_model_mem(LlamaData *priv, uint32_t param_types, TEE_Param params[4]) {
     const uint32_t expected_pt = TEE_PARAM_TYPES(
         TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_VALUE_INPUT,
-        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+        TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_NONE);
     if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
 
+    const size_t data_sz = params[0].memref.size;
+    const size_t local_offset = params[1].value.a;
     if (!priv->model_shm) {
-        priv->model_shm = system_shm_mmap();
+        size_t size = params[2].value.a;
+        size_t global_offset = params[2].value.b;
+        priv->shm_offset = global_offset % PTA_SYSTEM_SHM_MMAP_ALIGNMENT;
+        size_t global_end = ROUNDUP(global_offset + size, PTA_SYSTEM_SHM_MMAP_ALIGNMENT);
+        global_offset = ROUNDDOWN(global_offset, PTA_SYSTEM_SHM_MMAP_ALIGNMENT);
+        size = global_end - global_offset;
+        priv->model_shm = system_shm_mmap(size, global_offset);
         if (!priv->model_shm)
             return TEE_ERROR_GENERIC;
     }
-    const size_t data_sz = params[0].memref.size;
-    const size_t offset = params[1].value.a;
-    memcpy((char*)priv->model_shm + offset, params[0].memref.buffer, data_sz);
+    memcpy((char*)priv->model_shm + priv->shm_offset + local_offset, params[0].memref.buffer, data_sz);
     return TEE_SUCCESS;
 }
 
