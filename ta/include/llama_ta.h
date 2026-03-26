@@ -74,16 +74,18 @@ static void __attribute__((unused)) build_sampler_config(SamplerConfig* config, 
 /*
  * TA_LLAMA_CMD_MODEL_MEM_WRITE_AT - write to memory buffer allocated by TA_LLAMA_CMD_MODEL_MEM_CREATE
  * param[0] (memref) in: data to append to object
- * param[1] (value.a) in: memory offset to write at
- * param[2] unused
+ * param[1] (value.a) in: local memory offset to write at
+ * param[2] (value.a) in: size of cipher
+ *          (value.b) in: global memory offset to write at
  * param[3] unused
+ *
+ * NOTE: param[2] is only used on first invoke
  */
 #define TA_LLAMA_CMD_MODEL_MEM_WRITE_AT 7
 
 /*
  * TA_LLAMA_CMD_DECRYPT - decrypt designated region of memory
- * param[0] (value.a) in: memory offset of the region
- *          (value.b) in: size of the region
+ * param[0] (value.a) in: size of the region
  * param[1] (memref) in: tag of the ciphertext
  * param[2] unused
  * param[3] unused

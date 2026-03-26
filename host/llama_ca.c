@@ -390,7 +390,7 @@ void batch_transfer_mem(int tid, TEEC_Context *ctx, TEEC_Session *sess, struct M
     const uint32_t plain_offset = cipher_begin - TAG_SZ * tid;
     const uint32_t cipher_sz = cipher_end - cipher_begin;
     void * const tag = payload + cipher_end;
-    uint32_t dst_offset = plain_offset;
+    uint32_t dst_offset = 0;
 
     size_t batch_size = MIN(cipher_end - cipher_begin, SHM_MAX_SIZE);
     TEEC_SharedMemory shm;
@@ -409,8 +409,10 @@ void batch_transfer_mem(int tid, TEEC_Context *ctx, TEEC_Session *sess, struct M
             .params[0].memref.offset = 0,
             .params[0].memref.size = batch_size,
             .params[1].value.a = dst_offset,
+            .params[2].value.a = cipher_sz,
+            .params[2].value.b = plain_offset,
             .paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_PARTIAL_INPUT, TEEC_VALUE_INPUT,
-                                            TEEC_NONE, TEEC_NONE)
+                                            TEEC_VALUE_INPUT, TEEC_NONE)
         };
         uint32_t err_origin;
         res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_MODEL_MEM_WRITE_AT, &op, &err_origin);
@@ -426,8 +428,7 @@ void batch_transfer_mem(int tid, TEEC_Context *ctx, TEEC_Session *sess, struct M
     TEEC_ReleaseSharedMemory(&shm);
 
     TEEC_Operation op = {
-        .params[0].value.a = plain_offset,
-        .params[0].value.b = cipher_sz,
+        .params[0].value.a = cipher_sz,
         .params[1].tmpref.buffer = tag,
         .params[1].tmpref.size = TAG_SZ,
         .paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_MEMREF_TEMP_INPUT,
