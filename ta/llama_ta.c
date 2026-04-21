@@ -6,57 +6,19 @@
 
 #include <tee_internal_api.h>
 #include <tee_internal_api_extensions.h>
-#include <pta_system.h>
 #include <llama_ta.h>
 
 // ----------------------------------------------------------------------------
-// pta helper functions
-
-static TEE_Result invoke_system_pta(uint32_t cmd_id, uint32_t param_types, TEE_Param params[TEE_NUM_PARAMS]) {
-	static TEE_TASessionHandle sess = TEE_HANDLE_NULL;
-	static const TEE_UUID uuid = PTA_SYSTEM_UUID;
-
-	if (sess == TEE_HANDLE_NULL) {
-		TEE_Result res = TEE_OpenTASession(&uuid, TEE_TIMEOUT_INFINITE,
-						   0, NULL, &sess, NULL);
-
-		if (res)
-			return res;
-	}
-
-	return TEE_InvokeTACommand(sess, TEE_TIMEOUT_INFINITE, cmd_id,
-				   param_types, params, NULL);
-}
+// allocate functions
 
 static void* system_alloc(size_t nbytes) {
-    assert(nbytes % PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT == 0);
-    TEE_Param params[TEE_NUM_PARAMS];
-	params[0].value.a = nbytes;
-	params[0].value.b = 0;
-	uint32_t param_types = TEE_PARAM_TYPES(
-        TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_VALUE_OUTPUT,
-        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-	TEE_Result res = invoke_system_pta(PTA_SYSTEM_PROTMEM_ALLOC, param_types, params);
-	if (res != TEE_SUCCESS) {
-		EMSG("Failed to allocate protmem: 0x%x", res);
-		return NULL;
-	}
-    return (void*)reg_pair_to_64(params[1].value.a, params[1].value.b);
+    void *p = malloc(nbytes);
+    if (!p) EMSG("malloc() fails");
+    return p;
 }
 
-static void system_free(void *va, size_t nbytes) {
-    // scrub the memory before freeing
-    memset(va, 0, nbytes);
-
-    TEE_Param params[TEE_NUM_PARAMS];
-    reg_pair_from_64((uint64_t)va, &params[0].value.a, &params[0].value.b);
-    uint32_t param_types = TEE_PARAM_TYPES(
-        TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_NONE,
-        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-	TEE_Result res = invoke_system_pta(PTA_SYSTEM_PROTMEM_FREE, param_types, params);
-	if (res != TEE_SUCCESS) {
-		EMSG("Failed to free protmem: 0x%x", res);
-	}
+static void system_free(void *va, size_t __unused nbytes) {
+    free(va);
 }
 
 // ----------------------------------------------------------------------------
@@ -140,7 +102,6 @@ static size_t get_run_state_nbytes(Config* p) {
 
 static void malloc_run_state(RunState* s, Config* p) {
     size_t nbytes = get_run_state_nbytes(p);
-    nbytes = ROUNDUP(nbytes, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
     void* va = system_alloc(nbytes);
     s->va = va;
     s->nbytes = nbytes;
@@ -507,7 +468,7 @@ static void build_sampler(Sampler* sampler, int vocab_size, float temperature, f
     sampler->rng_state = rng_seed;
     // buffer only used with nucleus sampling; may not need but it's ~small
     size_t sz = sampler->vocab_size * sizeof(ProbIndex);
-    sampler->probindex_sz = ROUNDUP(sz, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
+    sampler->probindex_sz = sz;
     sampler->probindex = system_alloc(sampler->probindex_sz);
 }
 
@@ -650,7 +611,7 @@ static TEE_Result append_secure_storage(LlamaData *priv, uint32_t param_types, T
 
     const size_t data_sz = params[1].memref.size;
     if (!priv->data) {
-        priv->data_sz = ROUNDUP(data_sz, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
+        priv->data_sz = data_sz;
         priv->data = system_alloc(priv->data_sz);
         if (!priv->data) {
             priv->data_sz = 0;
@@ -723,7 +684,7 @@ static TEE_Result read_secure_storage(TEE_Param id, void **data_p, size_t *data_
 		goto close_obj;
 	}
 
-    size_t data_sz = ROUNDUP(object_info.dataSize, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
+    size_t data_sz = object_info.dataSize;
     char *data = system_alloc(data_sz);
     if (!data) {
         res = TEE_ERROR_OUT_OF_MEMORY;
@@ -785,7 +746,6 @@ static TEE_Result create_model_mem(LlamaData *priv, uint32_t param_types, TEE_Pa
     if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
 
     size_t sz = params[0].value.a;
-    sz = ROUNDUP(sz, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
     void *p = system_alloc(sz);
     if (!p) { return TEE_ERROR_OUT_OF_MEMORY; }
     priv->model = p;
