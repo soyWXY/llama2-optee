@@ -421,6 +421,14 @@ void batch_write_mem(TEEC_Context *ctx, TEEC_Session *sess, FILE *file, size_t f
     }
 
     TEEC_ReleaseSharedMemory(&shm);
+
+    TEEC_Operation op = {};
+    uint32_t err_origin;
+    res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_DECRYPT, &op, &err_origin);
+    if (res != TEEC_SUCCESS) {
+        fprintf(stderr, "TA_LLAMA_CMD_DECRYPT failed with code 0x%x origin 0x%x\n", res, err_origin);
+        exit(EXIT_FAILURE);
+    }
 }
 
 void send_model_to_tee(TEEC_Context *ctx, TEEC_Session *sess, char *checkpoint_path) {

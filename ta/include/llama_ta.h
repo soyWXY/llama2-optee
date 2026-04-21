@@ -79,3 +79,12 @@ static void __attribute__((unused)) build_sampler_config(SamplerConfig* config, 
  * param[3] unused
  */
 #define TA_LLAMA_CMD_INIT_MODEL_WITH_MEM 6
+
+/*
+ * TA_LLAMA_CMD_DECRYPT - decrypt designated region of memory
+ * param[0] (value.a) in: size of the region
+ * param[1] (memref) in: tag of the ciphertext
+ * param[2] unused
+ * param[3] unused
+ */
+#define TA_LLAMA_CMD_DECRYPT 8

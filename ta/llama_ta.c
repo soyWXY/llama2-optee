@@ -810,9 +810,6 @@ static TEE_Result init_model_with_mem(LlamaData *priv, uint32_t param_types, TEE
     if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
     if (params[0].memref.size != sizeof(SamplerConfig)) { return TEE_ERROR_BAD_PARAMETERS; }
 
-    TEE_Result res = decrypt_model(priv->model, priv->model_size);
-    if (res != TEE_SUCCESS) { return res; }
-
     // build the Transformer
     Transformer *transformer = &priv->transformer;
     build_transformer(transformer, priv->model, priv->model_capacity);
@@ -845,6 +842,8 @@ TEE_Result TA_InvokeCommandEntryPoint(void *session, uint32_t cmd, uint32_t para
         return append_model_mem(priv, param_types, params);
     case TA_LLAMA_CMD_INIT_MODEL_WITH_MEM:
         return init_model_with_mem(priv, param_types, params);
+    case TA_LLAMA_CMD_DECRYPT:
+        return decrypt_model(priv->model, priv->model_size);
 	default:
 		EMSG("Command ID 0x%x is not supported", cmd);
 		return TEE_ERROR_NOT_SUPPORTED;
