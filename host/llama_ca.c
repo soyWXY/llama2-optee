@@ -565,8 +565,8 @@ int main(int argc, char *argv[]) {
 
         #pragma omp single
         {
-            create_mem(&sess, header->file_size);
             tick();
+            create_mem(&sess, header->file_size);
         }
 
         // transfer file in batches
