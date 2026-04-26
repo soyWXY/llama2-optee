@@ -1,4 +1,5 @@
 host/llama_ca.o
 host/llama_ca
 ta/out
+inference_ta/out
 dist/

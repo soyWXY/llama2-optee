@@ -59,56 +59,6 @@ static void system_free(void *va, size_t nbytes) {
 	}
 }
 
-#define SHM_KEY 0
-
-static TEE_Result system_shm_open(size_t nbytes) {
-    assert(nbytes % PTA_SYSTEM_SHM_OPEN_ALIGNMENT == 0);
-    TEE_Param params[TEE_NUM_PARAMS];
-	params[0].value.a = SHM_KEY;
-	params[1].value.a = nbytes;
-	uint32_t param_types = TEE_PARAM_TYPES(
-        TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_VALUE_INPUT,
-        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-	return invoke_system_pta(PTA_SYSTEM_SHM_OPEN, param_types, params);
-}
-
-static TEE_Result system_shm_close(void) {
-    TEE_Param params[TEE_NUM_PARAMS];
-	params[0].value.a = SHM_KEY;
-	uint32_t param_types = TEE_PARAM_TYPES(
-        TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_NONE,
-        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-	return invoke_system_pta(PTA_SYSTEM_SHM_CLOSE, param_types, params);
-}
-
-static void* system_shm_mmap(size_t size, size_t offset) {
-    TEE_Param params[TEE_NUM_PARAMS];
-	params[0].value.a = SHM_KEY;
-	params[2].value.a = size;
-	params[2].value.b = offset;
-	uint32_t param_types = TEE_PARAM_TYPES(
-        TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_VALUE_OUTPUT,
-        TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_NONE);
-	TEE_Result res = invoke_system_pta(PTA_SYSTEM_SHM_MMAP, param_types, params);
-    if (res != TEE_SUCCESS) {
-		EMSG("Failed to mmap shm: 0x%x", res);
-		return NULL;
-	}
-    return (void*)reg_pair_to_64(params[1].value.a, params[1].value.b);
-}
-
-static void system_shm_munmap(void *va) {
-    TEE_Param params[TEE_NUM_PARAMS];
-    reg_pair_from_64((uint64_t)va, &params[0].value.a, &params[0].value.b);
-	uint32_t param_types = TEE_PARAM_TYPES(
-        TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_NONE,
-        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-	TEE_Result res = invoke_system_pta(PTA_SYSTEM_SHM_MUNMAP, param_types, params);
-    if (res != TEE_SUCCESS) {
-		EMSG("Failed to mmunap shm(%p): 0x%x", va, res);
-	}
-}
-
 // ----------------------------------------------------------------------------
 // Transformer model
 
@@ -258,23 +208,17 @@ static void read_checkpoint(Transformer *t, float* data, size_t data_sz) {
     memory_map_weights(&t->weights, config, weights_ptr, shared_weights);
 }
 
+static void free_transformer2(Transformer* t) {
+    // free the RunState buffers
+    free_run_state(&t->state);
+}
+
 static void build_transformer(Transformer *t, void* data, size_t data_sz) {
+	if (t->state.va) free_transformer2(t);
     // read in the Config and the Weights from the checkpoint
     read_checkpoint(t, data, data_sz);
     // allocate the RunState buffers
     malloc_run_state(&t->state, &t->config);
-}
-
-static void free_transformer(Transformer* t) {
-    // free the TransformerWeights buffers
-    system_free(t->data, t->nbytes);
-    // free the RunState buffers
-    free_run_state(&t->state);
-}
-
-static void free_transformer2(Transformer* t) {
-    // free the RunState buffers
-    free_run_state(&t->state);
 }
 
 // ----------------------------------------------------------------------------
@@ -555,6 +499,10 @@ static int sample_topp(float* probabilities, int n, float topp, ProbIndex* probi
     return probindex[last_idx].index; // in case of rounding errors
 }
 
+static void free_sampler(Sampler* sampler) {
+    system_free(sampler->probindex, sampler->probindex_sz);
+}
+
 static void build_sampler(Sampler* sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
     sampler->vocab_size = vocab_size;
     sampler->temperature = temperature;
@@ -562,12 +510,9 @@ static void build_sampler(Sampler* sampler, int vocab_size, float temperature, f
     sampler->rng_state = rng_seed;
     // buffer only used with nucleus sampling; may not need but it's ~small
     size_t sz = sampler->vocab_size * sizeof(ProbIndex);
+	if (sampler->probindex) free_sampler(sampler);
     sampler->probindex_sz = ROUNDUP(sz, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
     sampler->probindex = system_alloc(sampler->probindex_sz);
-}
-
-static void free_sampler(Sampler* sampler) {
-    system_free(sampler->probindex, sampler->probindex_sz);
 }
 
 static unsigned int random_u32(unsigned long long *state) {
@@ -661,237 +606,9 @@ typedef struct {
     size_t data_sz;
     // shm for write_at_model_mem() to concurrently write to
     void *model_shm;
+    size_t shm_capacity;
     int shm_offset;
 } LlamaData;
-
-static TEE_Result create_secure_storage(uint32_t param_types, TEE_Param params[4]) {
-    const uint32_t expected_pt = TEE_PARAM_TYPES(
-        TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_NONE,
-        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-    if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
-
-    size_t obj_id_sz = params[0].memref.size;
-    char *obj_id = malloc(obj_id_sz);
-    if (!obj_id) return TEE_ERROR_OUT_OF_MEMORY;
-    memcpy(obj_id, params[0].memref.buffer, obj_id_sz);
-
-	uint32_t obj_data_flag = TEE_DATA_FLAG_SHARE_READ |
-			TEE_DATA_FLAG_SHARE_WRITE |
-			TEE_DATA_FLAG_OVERWRITE;
-	TEE_ObjectHandle object = TEE_HANDLE_NULL;
-	TEE_Result res = TEE_CreatePersistentObject(TEE_STORAGE_PRIVATE,
-					obj_id, obj_id_sz,
-					obj_data_flag,
-					TEE_HANDLE_NULL,
-					NULL, 0,
-					&object);
-	if (res != TEE_SUCCESS) {
-		EMSG("TEE_CreatePersistentObject failed 0x%08x", res);
-        goto free_id;
-	}
-
-    TEE_CloseObject(object);
-free_id:
-    free(obj_id);
-    return res;
-}
-
-static TEE_Result append_secure_storage(LlamaData *priv, uint32_t param_types, TEE_Param params[4]) {
-    const uint32_t expected_pt = TEE_PARAM_TYPES(
-        TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_MEMREF_INPUT,
-        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-    if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
-
-    const size_t data_sz = params[1].memref.size;
-    if (!priv->data) {
-        priv->data_sz = ROUNDUP(data_sz, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
-        priv->data = system_alloc(priv->data_sz);
-        if (!priv->data) {
-            priv->data_sz = 0;
-            return TEE_ERROR_OUT_OF_MEMORY;
-        }
-    }
-    if (data_sz > priv->data_sz) { return TEE_ERROR_BAD_PARAMETERS; }
-    memcpy(priv->data, params[1].memref.buffer, data_sz);
-
-    size_t obj_id_sz = params[0].memref.size;
-    char *obj_id = malloc(obj_id_sz);
-    if (!obj_id) return TEE_ERROR_OUT_OF_MEMORY;
-    memcpy(obj_id, params[0].memref.buffer, obj_id_sz);
-
-	TEE_ObjectHandle object = TEE_HANDLE_NULL;
-    TEE_Result res = TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
-					obj_id, obj_id_sz,
-					TEE_DATA_FLAG_ACCESS_WRITE |
-                    TEE_DATA_FLAG_SHARE_WRITE,
-					&object);
-	if (res != TEE_SUCCESS) {
-		EMSG("Failed to open persistent object, res=0x%08x", res);
-		goto free_id;
-	}
-
-    res = TEE_SeekObjectData(object, 0, TEE_DATA_SEEK_END);
-    if (res != TEE_SUCCESS) {
-		EMSG("TEE_SeekObjectData failed 0x%08x", res);
-        goto  close_obj;
-    }
-
-    res = TEE_WriteObjectData(object, priv->data, data_sz);
-	if (res != TEE_SUCCESS) {
-		EMSG("TEE_WriteObjectData failed 0x%08x", res);
-        goto  close_obj;
-    }
-
-close_obj:
-	TEE_CloseObject(object);
-free_id:    
-    free(obj_id);
-    return res;
-}
-
-// use @id to read model from secure storage, and return ephemeral buffer with @data_p and @data_sz_p
-static TEE_Result read_secure_storage(TEE_Param id, void **data_p, size_t *data_sz_p) {
-	size_t obj_id_sz = id.memref.size;
-    char *obj_id = malloc(obj_id_sz);
-    if (!obj_id) return TEE_ERROR_OUT_OF_MEMORY;
-
-    memcpy(obj_id, id.memref.buffer, obj_id_sz);
-
-	// Check the object exist and can be dumped into output buffer
-	// then dump it.
-	TEE_ObjectHandle object = TEE_HANDLE_NULL;
-	TEE_Result res = TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
-					obj_id, obj_id_sz,
-					TEE_DATA_FLAG_ACCESS_READ |
-					TEE_DATA_FLAG_SHARE_READ,
-					&object);
-	if (res != TEE_SUCCESS) {
-		EMSG("Failed to open persistent object, res=0x%08x", res);
-		goto free_id;
-	}
-
-	TEE_ObjectInfo object_info = { };
-	res = TEE_GetObjectInfo1(object, &object_info);
-	if (res != TEE_SUCCESS) {
-		EMSG("Failed to get object info, res=0x%08x", res);
-		goto close_obj;
-	}
-
-    size_t data_sz = ROUNDUP(object_info.dataSize, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
-    char *data = system_alloc(data_sz);
-    if (!data) {
-        res = TEE_ERROR_OUT_OF_MEMORY;
-        goto close_obj;
-    }
-
-	uint32_t read_bytes = 0;
-	res = TEE_ReadObjectData(object, data, object_info.dataSize, &read_bytes);
-	if (res != TEE_SUCCESS || read_bytes != object_info.dataSize) {
-		EMSG("TEE_ReadObjectData failed 0x%08x, read %" PRIu32 " over %u",
-				res, read_bytes, object_info.dataSize);
-        system_free(data, data_sz);
-		goto close_obj;
-	}
-    *data_p = data;
-    *data_sz_p = data_sz;
-close_obj:
-	TEE_CloseObject(object);
-free_id:    
-    free(obj_id);
-    return res;
-}
-
-static TEE_Result init_model_with_storage(LlamaData *priv, uint32_t param_types, TEE_Param params[4]) {
-    const uint32_t expected_pt = TEE_PARAM_TYPES(
-        TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_MEMREF_INPUT,
-        TEE_PARAM_TYPE_VALUE_OUTPUT, TEE_PARAM_TYPE_NONE);
-    if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
-    if (params[1].memref.size != sizeof(SamplerConfig)) { return TEE_ERROR_BAD_PARAMETERS; }
-
-    // release memory ASAP
-    if (priv->data) {
-        system_free(priv->data, priv->data_sz);
-        priv->data = NULL;
-        priv->data_sz = 0;
-    }
-
-    void *data = NULL;
-    size_t data_sz = 0;
-    TEE_Result res = read_secure_storage(params[0], &data, &data_sz);
-    if (res != TEE_SUCCESS) { return res; }
-
-    // build the Transformer via @data and @data_sz
-    Transformer *transformer = &priv->transformer;
-    build_transformer(transformer, data, data_sz);
-
-    // build the Sampler
-    SamplerConfig *config = (SamplerConfig *)params[1].memref.buffer;
-    build_sampler(&priv->sampler, transformer->config.vocab_size, config->temperature, config->topp, config->rng_seed);
-
-    params[2].value.a = transformer->config.vocab_size;
-    return res;
-}
-
-bool is_master_thread;
-
-static TEE_Result create_model_mem(uint32_t param_types, TEE_Param params[4]) {
-    const uint32_t expected_pt = TEE_PARAM_TYPES(
-        TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_NONE,
-        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-    if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
-
-    size_t sz = params[0].value.a;
-    sz = ROUNDUP(sz, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
-    TEE_Result res = system_shm_open(sz);
-    if (res != TEE_SUCCESS) {
-		EMSG("system_shm_open failed 0x%08x", res);
-        return res;
-	}
-    is_master_thread = true;
-    return TEE_SUCCESS;
-}
-
-static TEE_Result decrypt_model_mem(LlamaData *priv, uint32_t param_types, TEE_Param params[4]) {
-    const uint32_t expected_pt = TEE_PARAM_TYPES(
-        TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_MEMREF_INPUT,
-        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-    if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
-
-    const size_t ct_len = params[0].value.a;
-    uint8_t *tag = params[1].memref.buffer;
-    const size_t tag_sz = params[1].memref.size;
-    void *ciphertext = (char*)priv->model_shm + priv->shm_offset;
-    uint32_t pt_len = ct_len;
-
-    static const uint8_t aes_256_key[32] = {0};
-    static const uint8_t fixed_iv[12] = {0};
-
-    TEE_OperationHandle op = TEE_HANDLE_NULL;
-    TEE_ObjectHandle key_obj = TEE_HANDLE_NULL;
-    TEE_Result res = TEE_AllocateOperation(&op, TEE_ALG_AES_GCM, TEE_MODE_DECRYPT, 256);
-    if (res != TEE_SUCCESS) return res;
-
-    res = TEE_AllocateTransientObject(TEE_TYPE_AES, 256, &key_obj);
-    if (res != TEE_SUCCESS) goto cleanup_op;
-
-    TEE_Attribute attr;
-    TEE_InitRefAttribute(&attr, TEE_ATTR_SECRET_VALUE, aes_256_key, sizeof(aes_256_key));
-    res = TEE_PopulateTransientObject(key_obj, &attr, 1);
-    if (res != TEE_SUCCESS) goto cleanup_key;
-
-    res = TEE_SetOperationKey(op, key_obj);
-    if (res != TEE_SUCCESS) goto cleanup_key;
-
-    res = TEE_AEInit(op, (void *)fixed_iv, sizeof(fixed_iv), 128, 0, 0);
-    if (res != TEE_SUCCESS) goto cleanup_key;
-
-    res = TEE_AEDecryptFinal(op, ciphertext, ct_len, ciphertext, &pt_len, tag, tag_sz);
-cleanup_key:
-    TEE_FreeTransientObject(key_obj);
-cleanup_op:
-    TEE_FreeOperation(op);
-    return res;
-}
 
 static TEE_Result init_model_with_mem(LlamaData *priv, uint32_t param_types, TEE_Param params[4]) {
     const uint32_t expected_pt = TEE_PARAM_TYPES(
@@ -902,9 +619,6 @@ static TEE_Result init_model_with_mem(LlamaData *priv, uint32_t param_types, TEE
 
     // build the Transformer
     Transformer *transformer = &priv->transformer;
-    system_shm_munmap(priv->model_shm);
-    priv->model_shm = system_shm_mmap(0, 0);
-    if (!priv->model_shm) { return TEE_ERROR_GENERIC; }
     build_transformer(transformer, priv->model_shm, 0);
 
     // build the Sampler
@@ -915,79 +629,47 @@ static TEE_Result init_model_with_mem(LlamaData *priv, uint32_t param_types, TEE
     return TEE_SUCCESS;
 }
 
-static TEE_Result write_at_model_mem(LlamaData *priv, uint32_t param_types, TEE_Param params[4]) {
-    const uint32_t expected_pt = TEE_PARAM_TYPES(
-        TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_VALUE_INPUT,
-        TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_NONE);
-    if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
-
-    const size_t data_sz = params[0].memref.size;
-    const size_t local_offset = params[1].value.a;
-    if (!priv->model_shm) {
-        size_t size = params[2].value.a;
-        size_t global_offset = params[2].value.b;
-        priv->shm_offset = global_offset % PTA_SYSTEM_SHM_MMAP_ALIGNMENT;
-        size_t global_end = ROUNDUP(global_offset + size, PTA_SYSTEM_SHM_MMAP_ALIGNMENT);
-        global_offset = ROUNDDOWN(global_offset, PTA_SYSTEM_SHM_MMAP_ALIGNMENT);
-        size = global_end - global_offset;
-        priv->model_shm = system_shm_mmap(size, global_offset);
-        if (!priv->model_shm)
-            return TEE_ERROR_GENERIC;
-    }
-    memcpy((char*)priv->model_shm + priv->shm_offset + local_offset, params[0].memref.buffer, data_sz);
-    return TEE_SUCCESS;
-}
-
-static TEE_Result gather_model(LlamaData *priv, uint32_t param_types, TEE_Param params[4]) {
+static TEE_Result create_pt_buffer(LlamaData *priv, uint32_t param_types, TEE_Param params[4]) {
     const uint32_t expected_pt = TEE_PARAM_TYPES(
         TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_NONE,
         TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
     if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
 
-    size_t size = params[0].value.a;
-    size_t global_offset = params[0].value.b;
-    void *plaintext = (char*)priv->model_shm + priv->shm_offset;
-
-    TEE_Param ta2ta_params[TEE_NUM_PARAMS];
-	ta2ta_params[0].memref.buffer = plaintext;
-	ta2ta_params[0].memref.size = size;
-	ta2ta_params[1].value.a = global_offset;
-	uint32_t ta2ta_pt = TEE_PARAM_TYPES(
-        TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_VALUE_INPUT,
-        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-
-    TEE_TASessionHandle sess;
-	const TEE_UUID uuid = TA_INFERENCE_UUID;
-    TEE_Result res = TEE_OpenTASession(&uuid, TEE_TIMEOUT_INFINITE, 0, NULL, &sess, NULL);
-    if (res) return res;
-
-	res = TEE_InvokeTACommand(sess, TEE_TIMEOUT_INFINITE, TA_LLAMA_CMD_GATHER_MODEL,
-                    ta2ta_pt, ta2ta_params, NULL);
-    TEE_CloseTASession(sess);
-    return res;
+    size_t sz = params[0].value.a;
+    sz = ROUNDUP(sz, PTA_SYSTEM_PROTMEM_ALLOC_ALIGNMENT);
+	if (sz <= priv->shm_capacity) { return TEE_SUCCESS; }
+	
+	if (priv->model_shm) system_free(priv->model_shm, priv->shm_capacity);
+    priv->model_shm = system_alloc(sz);
+    priv->shm_capacity = sz;
+    return TEE_SUCCESS;
 }
 
-TEE_Result TA_InvokeCommandEntryPoint(void *session, uint32_t cmd, uint32_t param_types, TEE_Param params[4]) {
-    LlamaData *priv = (LlamaData *)session;
+static TEE_Result gather_model(LlamaData *priv, uint32_t param_types, TEE_Param params[4]) {
+    const uint32_t expected_pt = TEE_PARAM_TYPES(
+        TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_VALUE_INPUT,
+        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+    if (param_types != expected_pt) { return TEE_ERROR_BAD_PARAMETERS; }
+
+    const size_t data_sz = params[0].memref.size;
+    const size_t global_offset = params[1].value.a;
+    if (global_offset + data_sz >= priv->shm_capacity) { return TEE_ERROR_BAD_PARAMETERS; }
+
+    memcpy((char*)priv->model_shm + global_offset, params[0].memref.buffer, data_sz);
+    return TEE_SUCCESS;
+}
+
+TEE_Result TA_InvokeCommandEntryPoint(__unused void * session, uint32_t cmd, uint32_t param_types, TEE_Param params[4]) {
+	static LlamaData state;
     switch (cmd) {
 	case TA_LLAMA_CMD_GENERATE:
-		return generate(&priv->transformer, &priv->sampler, param_types, params);
-    case TA_LLAMA_CMD_MODEL_STORAGE_CREATE:
-        return create_secure_storage(param_types, params);
-    case TA_LLAMA_CMD_MODEL_STORAGE_APPEND:
-        return append_secure_storage(priv, param_types, params);
-    case TA_LLAMA_CMD_INIT_MODEL_WITH_STORAGE:
-        return init_model_with_storage(priv, param_types, params);
-    case TA_LLAMA_CMD_MODEL_MEM_CREATE:
-        return create_model_mem(param_types, params);
+		return generate(&state.transformer, &state.sampler, param_types, params);
     case TA_LLAMA_CMD_INIT_MODEL_WITH_MEM:
-        return init_model_with_mem(priv, param_types, params);
-    case TA_LLAMA_CMD_MODEL_MEM_WRITE_AT:
-        return write_at_model_mem(priv, param_types, params);
-    case TA_LLAMA_CMD_DECRYPT:
-        return decrypt_model_mem(priv, param_types, params);
+        return init_model_with_mem(&state, param_types, params);
+    case TA_LLAMA_CMD_PT_BUFFER_CREATE:
+        return create_pt_buffer(&state, param_types, params);
     case TA_LLAMA_CMD_GATHER_MODEL:
-        return gather_model(priv, param_types, params);
+        return gather_model(&state, param_types, params);
 	default:
 		EMSG("Command ID 0x%x is not supported", cmd);
 		return TEE_ERROR_NOT_SUPPORTED;
@@ -1003,25 +685,9 @@ void TA_DestroyEntryPoint(void) {
 	/* Nothing to do */
 }
 
-TEE_Result TA_OpenSessionEntryPoint(uint32_t __unused param_types, TEE_Param __unused params[4], void **session) {
-    // start allocating session data
-    LlamaData *priv = malloc(sizeof(LlamaData));
-    if (priv == NULL) { return TEE_ERROR_OUT_OF_MEMORY; }
-    priv->transformer.data = NULL;
-    priv->data = NULL;
-    priv->data_sz = 0;
-    priv->model_shm = NULL;
-    *session = priv;
+TEE_Result TA_OpenSessionEntryPoint(uint32_t __unused param_types, TEE_Param __unused params[4], __unused void **session) {
     return TEE_SUCCESS;
 }
 
-void TA_CloseSessionEntryPoint(void *session) {
-    assert(session != NULL);
-    LlamaData *priv = (LlamaData *)session;
-    system_shm_munmap(priv->model_shm);
-    if (is_master_thread) {
-        system_shm_close();
-    }
-    free(session);
-    DMSG("LGTM!!!");
+void TA_CloseSessionEntryPoint(__unused void * session) {
 }

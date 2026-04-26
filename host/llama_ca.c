@@ -20,6 +20,9 @@
 
 #include <time.h>
 
+struct timespec gather_start[4];
+struct timespec gather_end[4];
+
 struct timespec start;
 void tick() {
     clock_gettime(CLOCK_REALTIME, &start);
@@ -30,6 +33,15 @@ double tock() {
     double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
     return elapsed;
 }
+double elapsed_second(struct timespec *t1, struct timespec *t2) {
+    return (t2->tv_sec - t1->tv_sec) + (t2->tv_nsec - t1->tv_nsec) / 1e9;
+}
+bool t1_greater_than_t2(struct timespec *t1, struct timespec *t2) {
+    return t1->tv_sec > t2->tv_sec ||
+            (t1->tv_sec == t2->tv_sec && t1->tv_nsec > t2->tv_nsec);
+}
+
+TEEC_Session inf_sess;
 
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
@@ -389,6 +401,17 @@ void create_mem(TEEC_Session *sess, size_t file_size) {
         fprintf(stderr, "TA_LLAMA_CMD_MODEL_MEM_CREATE failed with code 0x%x origin 0x%x\n", res, err_origin);
         exit(EXIT_FAILURE);
     }
+
+    op = (TEEC_Operation){
+        .params[0].value.a = file_size,
+        .paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE,
+                                       TEEC_NONE, TEEC_NONE)
+    };
+    res = TEEC_InvokeCommand(&inf_sess, TA_LLAMA_CMD_PT_BUFFER_CREATE, &op, &err_origin);
+    if (res != TEEC_SUCCESS) {
+        fprintf(stderr, "TA_LLAMA_CMD_PT_BUFFER_CREATE failed with code 0x%x origin 0x%x\n", res, err_origin);
+        exit(EXIT_FAILURE);
+    }
 }
 
 void batch_transfer_mem(int tid, TEEC_Context *ctx, TEEC_Session *sess, struct ModelBinaryHeader *header, void *payload) {
@@ -454,6 +477,22 @@ void batch_transfer_mem(int tid, TEEC_Context *ctx, TEEC_Session *sess, struct M
         fprintf(stderr, "TA_LLAMA_CMD_DECRYPT failed with code 0x%x origin 0x%x\n", res, err_origin);
         exit(EXIT_FAILURE);
     }
+    
+    clock_gettime(CLOCK_REALTIME, &gather_start[tid]);
+
+    op = (TEEC_Operation){
+        .params[0].value.a = cipher_sz,
+        .params[0].value.b = plain_offset,
+        .paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE,
+                                        TEEC_NONE, TEEC_NONE)
+    };
+    res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_GATHER_MODEL, &op, &err_origin);
+    if (res != TEEC_SUCCESS) {
+        fprintf(stderr, "TA_LLAMA_CMD_GATHER_MODEL failed with code 0x%x origin 0x%x\n", res, err_origin);
+        exit(EXIT_FAILURE);
+    }
+
+    clock_gettime(CLOCK_REALTIME, &gather_end[tid]);
 }
 
 void *mmap_checkpoint(char *checkpoint_path, ssize_t *file_size) {
@@ -552,6 +591,14 @@ int main(int argc, char *argv[]) {
     ssize_t file_size;
     void *data = mmap_checkpoint(checkpoint_path, &file_size);
     struct ModelBinaryHeader *header = (struct ModelBinaryHeader*)data;
+    TEEC_UUID inf_uuid = TA_INFERENCE_UUID;
+    uint32_t err_origin;
+    res = TEEC_OpenSession(&ctx, &inf_sess, &inf_uuid, TEEC_LOGIN_PUBLIC, NULL, NULL, &err_origin);
+    if (res != TEEC_SUCCESS) {
+        fprintf(stderr, "TEEC_Opensession failed with code 0x%x origin 0x%x\n", res, err_origin);
+        exit(EXIT_FAILURE);
+    }
+    struct timespec init_start;
     #pragma omp parallel num_threads(header->nblock)
     {
         TEEC_Session sess;
@@ -565,7 +612,7 @@ int main(int argc, char *argv[]) {
 
         #pragma omp single
         {
-            tick();
+            clock_gettime(CLOCK_REALTIME, &init_start);
             create_mem(&sess, header->file_size);
         }
 
@@ -577,18 +624,26 @@ int main(int argc, char *argv[]) {
 
         #pragma omp single nowait
         {
-            double t1 = tock();
-            int vocab_size = init_generate_ctx(&sess, &sampler_config);
+            int vocab_size = init_generate_ctx(&inf_sess, &sampler_config);
 
             // build the Tokenizer via the tokenizer .bin file
             Tokenizer tokenizer;
             build_tokenizer(&tokenizer, tokenizer_path, vocab_size);
             
             // run!
-            tick();
-            generate(&ctx, &sess, &tokenizer, prompt, steps);
-            double t2 = tock();
-            printf("transfer + decrypt: %f\ninference: %f\n", t1, t2);
+            generate(&ctx, &inf_sess, &tokenizer, prompt, steps);
+
+            struct timespec *gather_start_latest = &gather_start[0];
+            struct timespec *gather_end_latest = &gather_end[0];
+            for (int i = 1; i < header->nblock; ++i) {
+                if (t1_greater_than_t2(&gather_start[i], gather_start_latest))
+                    gather_start_latest = &gather_start[i];
+                if (t1_greater_than_t2(&gather_end[i], gather_end_latest))
+                    gather_end_latest = &gather_end[i];
+            }
+            double t1 = elapsed_second(&init_start, gather_start_latest);
+            double t2 = elapsed_second(gather_start_latest, gather_end_latest);
+            printf("transfer + decrypt: %f\ngather: %f\n", t1, t2);
 
             // clean up handles
             free_tokenizer(&tokenizer);
@@ -597,6 +652,7 @@ int main(int argc, char *argv[]) {
         TEEC_CloseSession(&sess);
     }
 
+    TEEC_CloseSession(&inf_sess);
     munmap(data, file_size);
 
     // destroy TEE context

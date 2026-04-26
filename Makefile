@@ -20,12 +20,14 @@ all: $(DEP) build install
 build:
 	$(MAKE) -C host CROSS_COMPILE="$(HOST_CROSS_COMPILE)" --no-builtin-variables $(HOST_FLAGS)
 	$(MAKE) -C ta CROSS_COMPILE="$(TA_CROSS_COMPILE)" LDFLAGS="" $(TA_FLAGS)
+	$(MAKE) -C inference_ta CROSS_COMPILE="$(TA_CROSS_COMPILE)" LDFLAGS="" $(TA_FLAGS)
 
 .PHONY: clean
 clean:
 	$(MAKE) -C host clean
 	$(MAKE) -C ta clean $(TA_FLAGS)
-	
+	$(MAKE) -C inference_ta clean $(TA_FLAGS)
+
 # user-defined rules
 .PHONY: dep/openlibm
 dep/openlibm:
