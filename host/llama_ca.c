@@ -302,67 +302,6 @@ struct ModelBinaryHeader {
     uint32_t intervals[];
 };
 
-void create_storage(TEEC_Session *sess, char *model_id) {
-    TEEC_Operation op = {
-        .params[0].tmpref.buffer = model_id,
-        .params[0].tmpref.size = strlen(model_id),
-        .paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT, TEEC_NONE,
-                                       TEEC_NONE, TEEC_NONE)
-    };
-    uint32_t err_origin;
-    TEEC_Result res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_MODEL_STORAGE_CREATE, &op, &err_origin);
-    if (res != TEEC_SUCCESS) {
-        fprintf(stderr, "TA_LLAMA_CMD_MODEL_STORAGE_CREATE failed with code 0x%x origin 0x%x\n", res, err_origin);
-        exit(EXIT_FAILURE);
-    }
-}
-
-void batch_write_storage(TEEC_Context *ctx, TEEC_Session *sess, char *model_id, FILE *file) {
-    // if SHM_MAX_SIZE equals to TEEC_CONFIG_SHAREDMEM_MAX_SIZE, TEEC_AllocateSharedMemory will return out
-    // -of-memory when writing stories15M.bin model 
-    const size_t SHM_MAX_SIZE = 0x40000;
-    assert(SHM_MAX_SIZE <= TEEC_CONFIG_SHAREDMEM_MAX_SIZE);
-
-    fseek(file, 0, SEEK_END); // move file pointer to end of file
-    ssize_t file_size = ftell(file); // get the file size, in bytes
-    if (file_size < 0) { fprintf(stderr, "ftell failed!\n"); exit(EXIT_FAILURE); }
-    size_t remain_size = file_size;
-    fseek(file, 0, SEEK_SET); // move file pointer to begin of file
-
-    size_t batch_size = MIN(remain_size, SHM_MAX_SIZE);
-    TEEC_SharedMemory shm;
-    shm.size = batch_size;
-    shm.flags = TEEC_MEM_INPUT;
-    TEEC_Result res = TEEC_AllocateSharedMemory(ctx, &shm);
-	if (res != TEEC_SUCCESS) {
-		fprintf(stderr, "TEEC_AllocateSharedMemory failed with code 0x%x\n", res);
-        exit(EXIT_FAILURE);
-    }
-
-    while (remain_size) {
-        fread(shm.buffer, 1, batch_size, file);
-        TEEC_Operation op = {
-            .params[0].tmpref.buffer = model_id,
-            .params[0].tmpref.size = strlen(model_id),
-            .params[1].memref.parent = &shm,
-            .params[1].memref.offset = 0,
-            .params[1].memref.size = batch_size,
-            .paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT, TEEC_MEMREF_WHOLE,
-                                           TEEC_NONE, TEEC_NONE)
-        };
-        uint32_t err_origin;
-        res = TEEC_InvokeCommand(sess, TA_LLAMA_CMD_MODEL_STORAGE_APPEND, &op, &err_origin);
-        if (res != TEEC_SUCCESS) {
-            fprintf(stderr, "TA_LLAMA_CMD_MODEL_STORAGE_APPEND failed with code 0x%x origin 0x%x\n", res, err_origin);
-            exit(EXIT_FAILURE);
-        }
-        remain_size -= batch_size;
-        batch_size = MIN(remain_size, SHM_MAX_SIZE);
-    }
-
-    TEEC_ReleaseSharedMemory(&shm);
-}
-
 void create_mem(TEEC_Session *sess, size_t file_size) {
     TEEC_Operation op = {
         .params[0].value.a = file_size,
